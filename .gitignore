@@ -1,0 +1,20 @@
+# Archivos temporales
+*.pyc
+__pycache__/
+
+# Entorno virtual
+venv/
+.env/
+
+# Shapefiles y datos pesados de Natural Earth
+*.zip
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+
+# Salidas gráficas/CSVs
+*.png
+*.csv
