@@ -19,6 +19,8 @@ import fiona
 import pandas as pd
 from pyproj import Geod
 import numpy as np
+from verificar_capas import verificar_y_descargar_capas
+import matplotlib.patches as mpatches
 
 # -------------------------------
 # CONFIGURACIÓN GENERAL
@@ -26,19 +28,19 @@ import numpy as np
 
 # Puntos de análisis
 puntos = {
-    "p1": {"coords": (-41.41972, -64.40194), "color": "red"},
-    "p2": {"coords": (-41.11806, -65.09806), "color": "red"},
+    "p1_transito": {"coords": (-41.41972, -64.40194), "color": "red"},
+    "p2_planta": {"coords": (-41.11806, -65.09806), "color": "red"},
 }
 # Archivos shapefile locales
 shapefiles = {
-    "coast": "/home/pato/Documentos/Black River/ne_50m_coastline",
-    "land": "/home/pato/Documentos/Black River/ne_50m_land",
-    "ocean": "/home/pato/Documentos/Black River/ne_50m_ocean",
-    "boundaries": "/home/pato/Documentos/Black River/ne_50m_admin_0_boundary_lines_land",
-    "cities": "/home/pato/Documentos/Black River/ne_10m_populated_places",
-    "rivers": "/home/pato/Documentos/Black River/ne_10m_rivers_lake_centerlines",
-    "roads": "/home/pato/Documentos/Black River/ne_10m_roads",
-    "provinces": "/home/pato/Documentos/Black River/ne_10m_admin_1_states_provinces"
+    "ne_50m_coastline": "Capas/ne_50m_coastline",
+    "ne_50m_land": "Capas/ne_50m_land",
+    "ne_50m_ocean": "Capas/ne_50m_ocean",
+    "ne_50m_admin_0_boundary_lines_land": "Capas/ne_50m_admin_0_boundary_lines_land",
+    "ne_10m_populated_places": "Capas/ne_10m_populated_places",
+    "ne_10m_rivers_lake_centerlines": "Capas/ne_10m_rivers_lake_centerlines",
+    "ne_10m_roads": "Capas/ne_10m_roads",
+    "ne_10m_admin_1_states_provincias": "Capas/ne_10m_admin_1_states_provincias"
 }
 
 
@@ -49,7 +51,7 @@ INCLUIR_ORIGEN_Y_EXTREMO = True
 
 
 # Bounding box (None para automático)
-bounding_box = [-63, -66, -40.5, -43]
+bounding_box = [-63.5, -65.5, -40.5, -42.5]
 
 # Máxima distancia si no hay costa
 radio_max_km = 100
@@ -80,7 +82,7 @@ FALLBACK_CIUDADES = [
 # -------------------------------
 def plot_provincias(ax, extent):
     try:
-        shp = resolve_shp(shapefiles["provinces"])
+        shp = resolve_shp(shapefiles["ne_10m_admin_1_states_provincias"])
         with fiona.open(shp) as src:
             for feat in src:
                 props = feat["properties"]
@@ -102,7 +104,7 @@ def plot_ciudades(ax, extent, min_pop=None):
     min_pop: si se especifica, filtra por población mínima.
     """
     try:
-        shp = resolve_shp(shapefiles["cities"])
+        shp = resolve_shp(shapefiles["ne_10m_populated_places"])
         with fiona.open(shp) as src:
             for feat in src:
                 props = feat["properties"]
@@ -112,18 +114,24 @@ def plot_ciudades(ax, extent, min_pop=None):
                         continue
                     name = props.get("NAME") or props.get("NAMEASCII")
                     geom = sgeom.shape(feat["geometry"])
-                    lon, lat = geom.x, geom.y
+                    # Obtener lon, lat correctamente
+                    if geom.geom_type == "Point":
+                        lon, lat = geom.xy[0][0], geom.xy[1][0]
+                    elif geom.geom_type == "MultiPoint" and hasattr(geom, "geoms"):
+                        lon, lat = geom.geoms[0].xy[0][0], geom.geoms[0].xy[1][0]
+                    else:
+                        continue
                     # Filtrar por bounding box
                     if extent[0] <= lon <= extent[1] and extent[2] <= lat <= extent[3]:
                         ax.plot(lon, lat, marker='.', color='k', ms=3, transform=ccrs.PlateCarree())
-                        ax.text(lon+0.05, lat+0.05, name, fontsize=8, transform=ccrs.PlateCarree())
+                        ax.text(lon+0.05, lat+0.05, str(name), fontsize=8, transform=ccrs.PlateCarree())
     except Exception as e:
-        print(f"⚠️ No pude cargar ciudades desde {shapefiles['cities']}: {e}")
+        print(f"⚠️ No pude cargar ciudades desde {shapefiles['ne_10m_populated_places']}: {e}")
         # Fallback manual
         for name, lat, lon in FALLBACK_CIUDADES:
             if extent[0] <= lon <= extent[1] and extent[2] <= lat <= extent[3]:
                 ax.plot(lon, lat, marker='.', color='k', ms=3, transform=ccrs.PlateCarree())
-                ax.text(lon+0.05, lat+0.05, name, fontsize=8, transform=ccrs.PlateCarree())
+                ax.text(lon+0.05, lat+0.05, str(name), fontsize=8, transform=ccrs.PlateCarree())
 
 def resolve_shp(path_like):
     import os, glob
@@ -275,7 +283,7 @@ def dibujar_rosa_referencia(fig, anchor=(0.15, 0.15), size=0.18):
         axr.text(1.12*np.cos(theta), 1.12*np.sin(theta), name,
                  ha='center', va='center', fontsize=7)
     # círculo externo
-    circ = plt.Circle((0,0), R, fill=False, lw=1)
+    circ = mpatches.Circle((0,0), R, fill=False, lw=1)
     axr.add_patch(circ)
     axr.text(0, 0, "16-pt", ha='center', va='center', fontsize=8)
 
@@ -302,9 +310,12 @@ def cargar_geoms_poligono(path_dir):
 
 
 def exportar_csv(nombre, coords):
-    """Guarda las coordenadas en un CSV por punto."""
+    """Guarda las coordenadas en un CSV por punto, corrigiendo dist_km si está en metros y asegurando formato decimal estándar."""
     df = pd.DataFrame(coords)
-    df.to_csv(f"{nombre}_direcciones.csv", index=False)
+    if "dist_km" in df.columns:
+        # Corrige valores sospechosos (>500 km) asumiendo que están en metros
+        df["dist_km"] = df["dist_km"].apply(lambda x: x/1000 if x > 500 else x)
+    df.to_csv(f"{nombre}_direcciones.csv", index=False, float_format='%.6f', encoding='utf-8', sep=',')
 
 def _geom_within_extent(geom, extent):
     """Devuelve True si la geometría toca el bbox [lon_min, lon_max, lat_min, lat_max]."""
@@ -318,7 +329,7 @@ def plot_rios(ax, extent, min_scalerank=5):
     min_scalerank: menor = más importante. Usa <= para mostrar principales.
     """
     try:
-        shp = resolve_shp(shapefiles["rivers"])
+        shp = resolve_shp(shapefiles["ne_10m_rivers_lake_centerlines"])
         with fiona.open(shp) as src:
             for feat in src:
                 props = feat["properties"]
@@ -342,7 +353,7 @@ def plot_rutas(ax, extent, allowed_types=("Major Highway", "Road"), lw_major=1.2
     allowed_types: filtra por 'type' en NE (p.ej. 'Major Highway', 'Road').
     """
     try:
-        shp = resolve_shp(shapefiles["roads"])
+        shp = resolve_shp(shapefiles["ne_10m_roads"])
         with fiona.open(shp) as src:
             for feat in src:
                 props = feat["properties"]
@@ -364,7 +375,6 @@ def plot_rutas(ax, extent, allowed_types=("Major Highway", "Road"), lw_major=1.2
 
 def graficar_mapa(puntos, resultados, costa):
     """Grafica el mapa principal y el inset planisferio."""
-
     # Determinar bounding box
     if bounding_box:
         extent = bounding_box
@@ -374,85 +384,52 @@ def graficar_mapa(puntos, resultados, costa):
         margin = 1.0
         extent = [min(lons)-margin, max(lons)+margin,
                 min(lats)-margin, max(lats)+margin]
-
     figsize = calcular_figsize(extent, base_height=8)
-    fig = plt.figure(figsize=figsize)
-    # Usar add_subplot para obtener GeoAxes Cartopy
-    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    fig, ax = plt.subplots(figsize=figsize, subplot_kw={'projection': ccrs.PlateCarree()})
     ax.set_extent(extent, crs=ccrs.PlateCarree())
-
-    
-   
-
-    # Fondo
     ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="lightblue")
     ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="lightgray")
     ax.add_feature(cfeature.BORDERS.with_scale("50m"), linestyle="--", edgecolor="black")
-
-    # Grilla
     gl = ax.gridlines(draw_labels=True, linestyle="--")
     gl.top_labels = False
     gl.right_labels = False
-
-    
-    # Capas vectoriales extra (dentro del bbox)
-    plot_rios(ax, extent, min_scalerank=5)          # ríos principales
+    plot_rios(ax, extent, min_scalerank=5)
     plot_rutas(ax, extent, allowed_types=("Major Highway","Road"))
-
-    # Ciudades dentro del bbox (con umbral de población)
     plot_ciudades(ax, extent, min_pop=20000)
-
-
     plot_provincias(ax, extent)
-
-    # Nombre Argentina
-    ax.text(-66, -41, "ARGENTINA", transform=ccrs.PlateCarree(),
-            fontsize=14, weight="bold", color="gray",
+    ax.text(-66, -41, "ARGENTINA", fontsize=14, weight="bold", color="gray",
+            transform=ccrs.PlateCarree(),
             path_effects=[patheffects.withStroke(linewidth=3, foreground="white")])
-
-    # Puntos y direcciones
     for nombre, info in puntos.items():
         lat, lon = info["coords"]
         df = resultados[nombre]
-
         for dir_name in nombres_direcciones:
             sub = df[df["direccion"] == dir_name].sort_values("fraccion")
-
-            # Línea pasando por todos los intermedios
             ax.plot([lon] + sub["lon"].tolist(),
                     [lat] + sub["lat"].tolist(),
                     color="black", linewidth=0.9,
                     transform=ccrs.Geodetic(), zorder=2)
-
-            # Puntos intermedios visibles
             ax.scatter(sub["lon"], sub["lat"],
-                    s=30,  # tamaño del marcador
+                    s=30,
                     facecolor="yellow",
                     edgecolor="black",
                     transform=ccrs.PlateCarree(),
                     zorder=3)
-
-            # Destacar el extremo final con otro color
             if not sub.empty:
                 lat_end, lon_end = sub.iloc[-1][["lat", "lon"]]
                 ax.plot(lon_end, lat_end, marker="o", markersize=8,
                         markeredgecolor="red", markerfacecolor="white",
                         transform=ccrs.PlateCarree(), zorder=4)
-
     # Inset Atlántico Sur
-    sub_ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(), position=[0.70, 0.70, 0.25, 0.25])
-    # Definir límites del Atlántico Sur
-    atlantico_sur_extent = [-70, -40, -60, -30]  # [lon_min, lon_max, lat_min, lat_max]
+    sub_ax = fig.add_axes((0.70, 0.70, 0.25, 0.25), projection=ccrs.PlateCarree())
+    atlantico_sur_extent = [-70, -40, -60, -30]
     sub_ax.set_extent(atlantico_sur_extent, crs=ccrs.PlateCarree())
-    # Fondo mar y tierra
     sub_ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="lightblue")
     sub_ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="lightgray")
     sub_ax.coastlines()
-    # Marco rojo del mapa principal
     extent_inset = ax.get_extent()
     rect = sgeom.box(extent_inset[0], extent_inset[2], extent_inset[1], extent_inset[3])
     sub_ax.add_geometries([rect], crs=ccrs.PlateCarree(), facecolor="none", edgecolor="red", zorder=20)
-    
     dibujar_rosa_referencia(fig)
     out_png = "mapa_golfo.png"
     fig.savefig(out_png, dpi=300, bbox_inches="tight")
@@ -531,18 +508,78 @@ def cortar_en_costa(linea, costa):
 # MAIN
 # -------------------------------
 if __name__ == "__main__":
+    faltantes = []
+    verificar_y_descargar_capas(shapefiles, carpeta_capas="Capas")
     # Cargar geometrías
-    costa = cargar_geoms_linea(shapefiles["coast"])
-    tierra = cargar_geoms_poligono(shapefiles["land"])
-
+    try:
+        costa = cargar_geoms_linea(shapefiles["ne_50m_coastline"])
+    except Exception as e:
+        print(f"⚠️ No se pudo cargar la capa de costa: {e}")
+        costa = None
+        faltantes.append("ne_50m_coastline")
+    try:
+        tierra = cargar_geoms_poligono(shapefiles["ne_50m_land"])
+    except Exception as e:
+        print(f"⚠️ No se pudo cargar la capa de tierra: {e}")
+        tierra = None
+        faltantes.append("ne_50m_land")
     resultados = {}
     max_workers = os.cpu_count() or 1
+    step_km = 2.0  # separación de puntos sobre cada track
+
+    def calcular_direcciones_por_punto_km(nombre, lat, lon, costa, executor=None, step_km=2.0):
+        tareas = []
+        costa_wkb = costa.wkb
+        for az, dir_name in zip(direcciones, nombres_direcciones):
+            tareas.append((nombre, lat, lon, float(az), dir_name,
+                           float(radio_max_km), costa_wkb, int(radio_max_km/step_km)-1, True))
+        if executor is None:
+            out = []
+            for t in tareas:
+                filas = _worker_direccion(t)
+                out.extend(filas)
+            return out
+        else:
+            out = []
+            for filas in executor.map(_worker_direccion, tareas, chunksize=4):
+                out.extend(filas)
+            return out
+
+    def exportar_kml(nombre, df):
+        from simplekml import Kml, Style
+        kml = Kml()
+        style_line = Style()
+        style_line.linestyle.width = 2
+        style_line.linestyle.color = 'ff0000ff'  # rojo
+        style_point = Style()
+        style_point.iconstyle.color = 'ff00ffff'  # amarillo
+        for dir_name in nombres_direcciones:
+            sub = df[df["direccion"] == dir_name].sort_values("fraccion")
+            coords = [(row["lon"], row["lat"]) for _, row in sub.iterrows()]
+            if len(coords) > 1:
+                ls = kml.newlinestring(name=f"{nombre}_{dir_name}", coords=coords)
+                ls.style = style_line
+            for lon, lat in coords:
+                p = kml.newpoint(coords=[(lon, lat)])
+                p.style = style_point
+        kml.save(f"{nombre}_tracks.kml")
+
+    # Generar mapas y KML por punto
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
         for nombre, info in puntos.items():
             lat, lon = info["coords"]
-            coords = calcular_direcciones_por_punto(nombre, lat, lon, costa, executor=ex)
+            coords = calcular_direcciones_por_punto_km(nombre, lat, lon, costa, executor=ex, step_km=step_km)
             exportar_csv(nombre, coords)
-            resultados[nombre] = pd.DataFrame(coords)
+            df = pd.DataFrame(coords)
+            resultados = {nombre: df}
+            graficar_mapa({nombre: info}, resultados, costa)
+            exportar_kml(nombre, df)
 
-    graficar_mapa(puntos, resultados, costa)
+    # Al final del script
+    if faltantes:
+        print("\n⚠️ Capas faltantes (descarga manual recomendada):")
+        for capa in faltantes:
+            print(f"  - {capa} (ver https://www.naturalearthdata.com)")
+    else:
+        print("\nTodas las capas principales fueron cargadas correctamente.")
 
