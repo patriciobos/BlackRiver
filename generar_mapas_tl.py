@@ -1,431 +1,598 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# ========= LIMITES DE HILOS (antes de cualquier import pesado) =========
-import os
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-os.environ.setdefault("GDAL_CACHEMAX", "64")
-os.environ.setdefault("PROJ_NETWORK", "OFF")
+"""
+Mapas TL (planta / transito) con Basemap, interpolación suave y capas NE:
+- Interpolación RBF (thin-plate) + suavizado gaussiano (sin “asterisco radial”).
+- Rutas, límites provinciales (admin_1 lines) y ríos (centerlines).
+- Ciudades + punto especial por mapa (según archivo).
+- Datapoints apagados por defecto.
 
-# ===== Backend no interactivo para estabilidad (también en procesos hijos) =====
-import matplotlib
-matplotlib.use("Agg")
+Requiere: numpy, pandas, matplotlib, basemap, scipy, requests, pyshp
+"""
 
-import re
-import warnings
 from pathlib import Path
-from functools import lru_cache
-import multiprocessing as mp
+from typing import Tuple, Optional, Dict, List
+import re, io, zipfile
+
 import numpy as np
 import pandas as pd
+import requests
+import shapefile  # pyshp
+
+import matplotlib
+matplotlib.use("Agg")  # no abre ventana
 import matplotlib.pyplot as plt
-import geopandas as gpd
-from shapely.geometry import Point
-from shapely.strtree import STRtree
-from scipy.interpolate import griddata
-import rasterio
-from rasterio.transform import from_origin
+from mpl_toolkits.basemap import Basemap
+from matplotlib.colors import Normalize
 
-# Kriging (opcional)
-try:
-    from pykrige.ok import OrdinaryKriging
-    HAS_KRIGE = True
-except Exception:
-    HAS_KRIGE = False
+from scipy.interpolate import RBFInterpolator, griddata
+from scipy.spatial import cKDTree
+from scipy.ndimage import gaussian_filter
 
-# Cartopy
-import cartopy
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-cartopy.config['data_dir'] = str(Path("./Capas/shapefiles/natural_earth").resolve())
+import multiprocessing as mp
+import glob
 
-# ==========================
-# ===== PARÁMETROS =========
-# ==========================
+# =========================
+# CONFIGURACIÓN (editar acá)
+# =========================
 
-# Selección de corrida
-PROCESS_MODE   = "all"         # "all" | "filter"
-FILTER_PUNTO   = "planta"          # "planta" | "transito" | None
-FILTER_FECHA   = "2023-02-15"          # "2023-02-15" | "2023-08-15" | None
-FILTER_RANGO   = None          # "low" | "mid" | None
-FILTER_FREQ_HZ = 60          # p.ej. 10 | 270 | None
+# Archivos a procesar (100 Hz)
+CSV_LIST = sorted(glob.glob("input-data/gsm-*.csv"))
 
-# Columna de TL a usar
-TL_COLUMN = "tl_20m"
+# Carpeta de salida para los mapas
+MAPAS_DIR = Path("mapas")
+MAPAS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Bounding box (lon_min, lon_max, lat_min, lat_max) WGS84; None = auto
-bounding_box = [-65.5, -62.5, -43.5, -40.5]
+# Columnas
+LAT_COL = "lat"
+LON_COL = "lon"
+VAL_COL = "tl_zmin"
 
-# Puntos (lon, lat)
-puntos = {
-    "p1_transito": (-64.40194, -41.41972),
-    "p2_planta"  : (-65.09806, -41.11806),
+# Mostrar/ocultar capas
+DIBUJAR_CAMPO_TL  = True     # interpolación
+DIBUJAR_PUNTOS_TL = False    # datapoints medidos (apagado)
+DIBUJAR_CIUDADES  = True
+DIBUJAR_PUNTO_ESPECIAL = True
+
+# Capas vectoriales Natural Earth (todas activadas por defecto)
+DIBUJAR_LIMITES_PROVINCIALES = True
+DIBUJAR_RUTAS = True
+DIBUJAR_RIOS  = True
+
+# Puntos de análisis (lat, lon)
+puntos: Dict[str, Dict[str, object]] = {
+    "p1_transito": {"coords": (-41.41972, -64.40194), "color": "red"},
+    "p2_planta":   {"coords": (-41.11806, -65.09806), "color": "red"},
 }
-PUNTO_COLOR = "red"
 
-# Visualización TL (dB)
-VFIXED = True
-VMIN, VMAX = 50.0, 250.0
-CMAP = "jet_r"  # jet invertida (lo pediste así)
+# Estilo
+CMAP_NAME = "jet_r"
+CMAP_MIN, CMAP_MAX = 50.0, 220.0
+SEA_COLOR   = "#CFEFFF"
+LAND_COLOR  = "#E6E6E6"
+COAST_COLOR = "#222222"
+COUNTRY_COLOR = "#444444"
+GRID_COLOR  = "#777777"
 
-# Interpolación
-METHOD = "linear"      # "linear" | "kriging"
-KRIGE_VARIOGRAM = "spherical"
-KRIGE_NLAGS     = 12
+DATA_MARKER = "^"
+DATA_SIZE_PT = 10
+DATA_SCATTER_S = DATA_SIZE_PT**2
 
-# Grilla: objetivo visual + límites
-AUTO_GRID       = True
-TARGET_PIXELS_X = 1400     # ~ancho visual deseado en px
-GRID_MIN_STEP   = 0.003    # ~300 m aprox (ajustable)
-GRID_MAX_STEP   = 0.02
+PUNTO_MARKER = "^"
+PUNTO_MS = 12
+PUNTO_FACE_DEFAULT = "#E74C3C"
+PUNTO_EDGE = "#000000"
 
-# Máscara de mar
-MASK_MODE = "ocean"  # Desactivar máscara para depuración
-MASK_LAND = True
-CAPAS_DIR = Path("./Capas/shapefiles/natural_earth/physical")
+# BBox fijo del Golfo San Matías (para el mapa)
+USE_FIXED_BBOX = True
+BBOX_LAT_MIN, BBOX_LAT_MAX = -43.0, -40.5
+BBOX_LON_MIN, BBOX_LON_MAX = -66.0, -62.5
 
-# Dibujo Cartopy
-CARTOPY_SCALE = "110m"  # fondo en 110m por velocidad; costa 10m arriba
+# BBox para la grilla de interpolación (puede ser más grande)
+GRID_LAT_MIN, GRID_LAT_MAX = -44.0, -40.5  # Extiende solo la grilla hacia el sur
+GRID_LON_MIN, GRID_LON_MAX = -66.0, -62.5
 
-# Exportes
-OUT_DIR      = Path("./out")
-SAVE_GEO_TIFF = True
-DPI          = 160
+# Si no usás bbox fijo, se calcula a partir de los datos con este margen:
+MARGEN_DEG = 0.35
 
-# Multiproceso (spawn = seguro). Sube si tu RAM lo permite.
-N_WORKERS = min(6, mp.cpu_count())
+# Grilla de interpolación
+GRID_NX = 350
+GRID_NY = 350
 
-# ==========================
-# ===== ESTRUCTURA FS ======
-# ==========================
-RANGOS = {"low": (10, 250), "mid": (270, 570)}
-CSV_ROOTS = {"low": Path("./low-csv/csv"), "mid": Path("./mid-csv/csv")}
-CSV_PATTERN = re.compile(
-    r"gsm-(?P<punto>planta|transito)_(?P<fecha>\d{4}-\d{2}-\d{2})_f=(?P<freq>\d+)\s*Hz\.csv$",
-    re.IGNORECASE
-)
+# Interpolación suave (RBF) + suavizado final
+RBF_FUNCTION = "thin_plate_spline"   # suave y continuo
+RBF_SMOOTH   = 100.0                 # regularización (↑ = mucho más suave)
+RBF_NEIGHBORS = 100                  # más vecinos para suavizar
+RBF_MAX_RADIUS_KM = 100.0            # descartar > radio desde el dato más cercano
 
-# ==========================
-# ====== UTILIDADES ========
-# ==========================
-def normalize_bbox(bbox):
-    if bbox is None: return None
-    lon_min, lon_max, lat_min, lat_max = bbox
-    return [min(lon_min, lon_max), max(lon_min, lon_max),
-            min(lat_min, lat_max), max(lat_min, lat_max)]
+# Suavizado gaussiano post-interpolación (en celdas de la grilla)
+SUAVIZAR_GAUSS = True
+GAUSS_SIGMA = 4.0                    # suavizado gaussiano fuerte
 
-def find_csv_tasks():
-    tasks = []
-    for rango, root in CSV_ROOTS.items():
-        if FILTER_RANGO and rango != FILTER_RANGO: continue
-        for punto in ("planta", "transito"):
-            if FILTER_PUNTO and punto != FILTER_PUNTO: continue
-            base = root / punto
-            if not base.exists(): continue
-            for fecha_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-                fecha = fecha_dir.name
-                if FILTER_FECHA and fecha != FILTER_FECHA: continue
-                for fcsv in sorted(fecha_dir.glob("*.csv")):
-                    m = CSV_PATTERN.search(fcsv.name)
-                    if not m: continue
-                    freq = int(m.group("freq"))
-                    if FILTER_FREQ_HZ is not None and freq != FILTER_FREQ_HZ: continue
-                    tasks.append((rango, punto, fecha, freq, fcsv))
-    return tasks
+# Ciudades del GSM (etiqueta a la izquierda del marcador)
+CUSTOM_PLACES: List[Tuple[str, float, float]] = [
+    ("San Antonio Oeste", -40.732, -64.946),
+    ("Las Grutas",        -40.803, -65.083),
+    ("Bahía Creek",       -41.0836, -63.9317),
+    ("La Ensenada",       -41.155, -63.387),
+    ("Playas Doradas",    -41.627, -65.024),
+    ("Puerto Lobos",      -41.980, -65.050),
+    ("Puerto Madryn",     -42.769, -65.038),
+]
 
-def auto_grid_step(lons, lats):
-    # paso por tamaño del mapa
-    if bounding_box is not None:
-        lon_min, lon_max, lat_min, lat_max = normalize_bbox(bounding_box)
-    else:
-        lon_min, lon_max = float(np.nanmin(lons)), float(np.nanmax(lons))
-        lat_min, lat_max = float(np.nanmin(lats)), float(np.nanmax(lats))
-    width_deg = max(1e-6, lon_max - lon_min)
-    step_map = width_deg / max(400, TARGET_PIXELS_X)
+# Natural Earth (descarga auto a test/Capas)
+NE_BASE = "https://naciscdn.org/naturalearth"
+NATURAL_EARTH_LAYERS: Dict[str, Dict[str, str]] = {
+    "coastline": {
+        "url": f"{NE_BASE}/10m/physical/ne_10m_coastline.zip",
+        "folder": "ne_10m_coastline",
+        "shp": "ne_10m_coastline.shp",
+    },
+    "countries": {
+        "url": f"{NE_BASE}/10m/cultural/ne_10m_admin_0_countries.zip",
+        "folder": "ne_10m_admin_0_countries",
+        "shp": "ne_10m_admin_0_countries.shp",
+    },
+    "admin_1_lines": {
+        "url": f"{NE_BASE}/10m/cultural/ne_10m_admin_1_states_provinces_lines.zip",
+        "folder": "ne_10m_admin_1_states_provincias_lines",
+        "shp": "ne_10m_admin_1_states_provinces_lines.shp",
+    },
+    "roads": {
+        "url": f"{NE_BASE}/10m/cultural/ne_10m_roads.zip",
+        "folder": "ne_10m_roads",
+        "shp": "ne_10m_roads.shp",
+    },
+    "rivers": {
+        "url": f"{NE_BASE}/10m/physical/ne_10m_rivers_lake_centerlines.zip",
+        "folder": "ne_10m_rivers_lake_centerlines",
+        "shp": "ne_10m_rivers_lake_centerlines.shp",
+    },
+}
+CAPAS_DIR = Path("test/Capas")
 
-    # paso por densidad de puntos (mediana NN / 2)
-    if len(lons) >= 5:
-        coords = np.column_stack([lons, lats])
-        dmins = []
-        for i in range(len(coords)):
-            di = np.sqrt(((coords[i] - coords)**2).sum(axis=1))
-            di = di[di > 0]
-            if len(di):
-                dmins.append(di.min())
-        step_nn = (float(np.median(dmins)) / 2.0) if dmins else step_map
-    else:
-        step_nn = step_map
+DPI = 300
 
-    step = min(step_nn, step_map)
-    return min(max(step, GRID_MIN_STEP), GRID_MAX_STEP)
+# =========================
+# HELPERS
+# =========================
 
-# ---------- Máscara de mar ----------
-def choose_mask_file():
-    if not MASK_LAND or MASK_MODE is None:
-        return None, None
-
-    def find_shp(keyword):
-        if not CAPAS_DIR.exists(): return None
-        bad = ("coastline", "boundary_lines", "roads", "rivers", "lake", "places", "admin")
-        cands = []
-        for shp in CAPAS_DIR.glob("**/*.shp"):
-            name = shp.name.lower()
-            if keyword in name and not any(b in name for b in bad):
-                cands.append(shp)
-        return str(sorted(cands)[0]) if cands else None
-
-    if MASK_MODE == "ocean":
-        shp = find_shp("ocean")
-        if shp: return shp, "ocean"
-        shp = find_shp("land")
-        if shp: return shp, "land"
-    else:
-        shp = find_shp("land")
-        if shp: return shp, "land"
-        shp = find_shp("ocean")
-        if shp: return shp, "ocean"
-
-    # Fallback: naturalearth_lowres (tierra)
+def ensure_layer(capas_dir: Path, layer_key: str) -> Optional[Path]:
+    info = NATURAL_EARTH_LAYERS[layer_key]
+    folder = capas_dir / info["folder"]
+    shp_path = folder / info["shp"]
+    if shp_path.exists():
+        print(f"✔ Capa '{layer_key}' encontrada: {shp_path}")
+        return shp_path
+    url = info["url"]
+    print(f"↓ Descargando capa '{layer_key}' desde {url}")
     try:
-        ne_path = gpd.datasets.get_path("naturalearth_lowres")
-        return ne_path, "land"
-    except Exception:
-        return None, None
+        folder.mkdir(parents=True, exist_ok=True)
+        zip_path = capas_dir / f"{info['folder']}.zip"
+        # Si el zip ya existe, usarlo
+        if zip_path.exists():
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(folder)
+        else:
+            r = requests.get(url, timeout=60); r.raise_for_status()
+            with open(zip_path, 'wb') as f:
+                f.write(r.content)
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(folder)
+        if shp_path.exists():
+            print(f"✔ Capa '{layer_key}' lista en: {shp_path}")
+            return shp_path
+        else:
+            print(f"⚠ No se encontró el shapefile esperado tras extraer: {shp_path}")
+    except Exception as e:
+        print(f"⚠ Error descargando capa '{layer_key}': {e}")
+    return None
 
-@lru_cache(maxsize=2)
-def load_geoms_cached(path_shp):
-    if path_shp is None: return None
-    gdf = gpd.read_file(path_shp).to_crs("EPSG:4326")
-    gdf = gdf[gdf.geometry.type.isin(["Polygon","MultiPolygon"])]
-    if gdf.empty: return None
-    gdf = gdf.dissolve().explode(index_parts=False, ignore_index=True)
-    return gdf.geometry
+def compute_bounds(lats: np.ndarray, lons: np.ndarray, margin_deg: float = 0.35) -> Tuple[float, float, float, float]:
+    lat_min = float(np.nanmin(lats)) - margin_deg
+    lat_max = float(np.nanmax(lats)) + margin_deg
+    lon_min = float(np.nanmin(lons)) - margin_deg
+    lon_max = float(np.nanmax(lons)) + margin_deg
+    lat_min = max(-90, lat_min); lat_max = min(90, lat_max)
+    lon_min = max(-180, lon_min); lon_max = min(180, lon_max)
+    return lat_min, lat_max, lon_min, lon_max
 
-def raster_mask_from_polys(xs, ys, geoms, mode):
-    if geoms is None or len(geoms) == 0 or mode is None:
-        return np.ones((len(ys), len(xs)), dtype=bool)
+def build_basemap(lat_min, lat_max, lon_min, lon_max) -> Basemap:
+    return Basemap(projection="merc",
+                   llcrnrlat=lat_min, urcrnrlat=lat_max,
+                   llcrnrlon=lon_min, urcrnrlon=lon_max, resolution="i")
 
+def draw_base(m: Basemap):
+    m.drawmapboundary(fill_color=SEA_COLOR, zorder=0)
+    m.fillcontinents(color=LAND_COLOR, lake_color=SEA_COLOR, zorder=3)  # tierra por encima del campo
+    m.drawcoastlines(linewidth=0.7, color=COAST_COLOR, zorder=6)
+    m.drawcountries(linewidth=0.5, color=COUNTRY_COLOR, zorder=6)
+
+def draw_grid_top(m: Basemap):
     try:
-        list_geoms = list(geoms)
-    except Exception:
-        list_geoms = list(getattr(geoms, "geometry", geoms))
-
-    tree = STRtree(list_geoms)
-    mask = np.zeros((len(ys), len(xs)), dtype=bool)
-
-    def _resolve_candidates(cands):
-        import numpy as _np
-        if hasattr(cands, "dtype") and _np.issubdtype(cands.dtype, _np.integer):
-            return [list_geoms[int(i)] for i in cands.tolist()]
-        return list(cands)
-
-    pred = "intersects" if mode == "ocean" else None  # Usar intersects para incluir bordes
-
-    for j, lat in enumerate(ys):
-        for i, lon in enumerate(xs):
-            pt = Point(float(lon), float(lat))
-            try:
-                candidates = tree.query(pt, predicate=pred) if pred else tree.query(pt)
-            except TypeError:
-                candidates = tree.query(pt)
-            geoms_cand = _resolve_candidates(candidates)
-            if mode == "ocean":
-                mask[j, i] = any(poly.intersects(pt) for poly in geoms_cand)
-            else:
-                mask[j, i] = not any(poly.intersects(pt) for poly in geoms_cand)
-    print(f"Puntos en máscara: {np.sum(mask)} de {mask.size}")
-    return mask
-
-# ---------- Interpolación ----------
-def interp_linear(lons, lats, vals, xs, ys):
-    grid_x, grid_y = np.meshgrid(xs, ys)
-    return griddata(points=np.column_stack([lons, lats]),
-                    values=vals, xi=(grid_x, grid_y), method="linear")
-
-def interp_kriging(lons, lats, vals, xs, ys):
-    if not HAS_KRIGE:
-        warnings.warn("PyKrige no disponible. Usando 'linear'.")
-        return interp_linear(lons, lats, vals, xs, ys)
-    OK = OrdinaryKriging(lons, lats, vals,
-                         variogram_model=KRIGE_VARIOGRAM,
-                         nlags=KRIGE_NLAGS,
-                         verbose=False, enable_plotting=False)
-    z, _ = OK.execute("grid", xs, ys)
-    return np.asarray(z)
-
-# ---------- GeoTIFF ----------
-def save_geotiff(path_tif, xs, ys, z):
-    xs_sorted = np.sort(xs); ys_sorted = np.sort(ys)
-    px = float(np.mean(np.diff(xs_sorted)))
-    py = float(np.mean(np.diff(ys_sorted)))
-    transform = from_origin(xs_sorted.min(), ys_sorted.max(), px, py)
-    profile = {
-        "driver": "GTiff", "height": z.shape[0], "width": z.shape[1],
-        "count": 1, "dtype": rasterio.float32, "crs": "EPSG:4326",
-        "transform": transform, "compress": "lzw", "nodata": np.float32(np.nan),
-    }
-    with rasterio.open(path_tif, "w", **profile) as dst:
-        dst.write(z.astype(np.float32), 1)
-
-# ---------- Dibujo con Cartopy ----------
-def plot_map(xs, ys, z, bbox, title, puntos_dict, out_png):
-    print('Campo interpolado: min =', np.nanmin(z), 'max =', np.nanmax(z), 'NaNs =', np.isnan(z).sum())
-    proj = ccrs.PlateCarree()
-    fig = plt.figure(figsize=(8.8, 7.6), dpi=DPI)
-    ax  = plt.axes(projection=proj)
-    ax.set_extent([bbox[0], bbox[1], bbox[2], bbox[3]], crs=proj)
-
-    # Fondo océano
-    ax.add_feature(cfeature.OCEAN.with_scale("110m"), zorder=0, facecolor="#cfe7ff")
-
-    # Raster con pcolormesh suavizado
-    X, Y = np.meshgrid(xs, ys)
-    pcm = ax.pcolormesh(
-        X, Y, z,
-        cmap=CMAP,
-        vmin=VMIN if VFIXED else None,
-        vmax=VMAX if VFIXED else None,
-        shading="gouraud",    # suaviza
-        transform=proj,
-        zorder=5
-    )
-
-    # Tierra por arriba + costa fina
-    ax.add_feature(cfeature.LAND.with_scale("110m"), zorder=8, facecolor="#e6e6e6")
-    ax.coastlines(resolution="10m", linewidth=0.8, zorder=9)
-
-    # Contornos (isocontours)
-    try:
-        levels = np.arange(50, 111, 5)
-        cs = ax.contour(X, Y, z, levels=levels, colors="k",
-                        linewidths=0.25, alpha=0.35, transform=proj, zorder=7)
-        ax.clabel(cs, fmt="%d", inline=True, fontsize=7, inline_spacing=3,
-                  manual=False, levels=levels[::2])
+        par = m.drawparallels(np.linspace(m.llcrnrlat, m.urcrnrlat, 5),
+                              labels=[1,0,0,0], dashes=[2,2], fontsize=14,
+                              color=GRID_COLOR, zorder=13)
+        mer = m.drawmeridians(np.linspace(m.llcrnrlon, m.urcrnrlon, 5),
+                              labels=[0,0,0,1], dashes=[2,2], fontsize=14,
+                              color=GRID_COLOR, zorder=13)
+        for d in (par, mer):
+            for _, artists in d.items():
+                for a in artists:
+                    try: a.set_zorder(13)
+                    except Exception: pass
     except Exception:
         pass
 
-    # Puntos
-    for name, (lon, lat) in puntos_dict.items():
-        ax.plot(lon, lat, marker="o", ms=6, color=PUNTO_COLOR, transform=proj, zorder=20)
-        ax.text(lon, lat, f" {name}", fontsize=8, color=PUNTO_COLOR, transform=proj, zorder=21)
+def annotate_custom_places(m: Basemap):
+    for name, lat, lon in CUSTOM_PLACES:
+        x, y = m(lon, lat)
+        plt.plot([x],[y], marker="o", ms=10, mfc="#222222", mec="#FFFFFF", mew=0.6, zorder=12)
+        plt.text(x-6000, y, name, fontsize=8, color="#111",
+                 ha="right", va="center", zorder=12)
 
-    # Barra + grilla
-    cbar = plt.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("TL [dB]")
-    gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.4, linestyle="--")
-    gl.top_labels = False; gl.right_labels = False
+# ---- dibujo robusto de shapefiles de líneas con pyshp (filtrado por bbox) ----
 
-    ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
+def _bbox_intersects(a: Tuple[float,float,float,float], b: Tuple[float,float,float,float]) -> bool:
+    axmin, aymin, axmax, aymax = a
+    bxmin, bymin, bxmax, bymax = b
+    return not (axmax < bxmin or bxmax < axmin or aymax < bymin or bymax < aymin)
 
-# ==========================
-# ========== MP ============
-# ==========================
-G_MASK_PATH = None
-G_MASK_MODE = None
-
-def _child_init(mask_path, mask_mode):
-    import matplotlib as _mpl
-    _mpl.use("Agg")
-    global G_MASK_PATH, G_MASK_MODE
-    G_MASK_PATH = mask_path
-    G_MASK_MODE = mask_mode
-
-# ==========================
-# ======== WORKER ==========
-# ==========================
-def process_one(task):
-    rango, punto, fecha, freq, path_csv = task
-    df = pd.read_csv(path_csv)
-
-    lon_col = next((c for c in ("lon","longitude","x","lon_wgs84") if c in df.columns), None)
-    lat_col = next((c for c in ("lat","latitude","y","lat_wgs84") if c in df.columns), None)
-    if lon_col is None or lat_col is None:
-        raise ValueError(f"No encuentro columnas lon/lat en {path_csv.name}")
-    if TL_COLUMN not in df.columns:
-        raise ValueError(f"TL '{TL_COLUMN}' no está en {path_csv.name}. Disponibles: {', '.join([c for c in df.columns if c.lower().startswith('tl')])}")
-
-    lons = df[lon_col].to_numpy(dtype=float)
-    lats = df[lat_col].to_numpy(dtype=float)
-    vals = df[TL_COLUMN].to_numpy(dtype=float)
-
-    bbox = normalize_bbox(bounding_box)
-    if bbox is None:
-        lon_min, lon_max = np.nanmin(lons), np.nanmax(lons)
-        lat_min, lat_max = np.nanmin(lats), np.nanmax(lats)
-        pad_lon = (lon_max - lon_min) * 0.05
-        pad_lat = (lat_max - lat_min) * 0.05
-        bbox = [lon_min - pad_lon, lon_max + pad_lon, lat_min - pad_lat, lat_max + pad_lat]
-
-    step = auto_grid_step(lons, lats) if AUTO_GRID else GRID_MIN_STEP
-    xs = np.arange(bbox[0], bbox[1] + step*0.5, step)
-    ys = np.arange(bbox[2], bbox[3] + step*0.5, step)
-
-    if METHOD == "kriging":
-        zi = interp_kriging(lons, lats, vals, xs, ys)
-    else:
-        zi = interp_linear(lons, lats, vals, xs, ys)
-
-    if MASK_LAND:
-        geoms = load_geoms_cached(G_MASK_PATH)
-        mask  = raster_mask_from_polys(xs, ys, geoms, G_MASK_MODE)
-        zi    = np.where(mask, zi, np.nan)
-
-    out_dir = OUT_DIR / rango / punto / fecha
-    out_dir.mkdir(parents=True, exist_ok=True)
-    base = f"gsm-{punto}_{fecha}_f={freq}Hz"
-    out_png = out_dir / f"{base}.png"
-    out_tif = out_dir / f"{base}.tif"
-
-    title = f"TL [{TL_COLUMN}] - {punto} {fecha} - {rango} f={freq} Hz"
-    plot_map(xs, ys, zi, bbox, title, puntos, out_png)
-
-    if SAVE_GEO_TIFF:
-        save_geotiff(out_tif, xs, ys, zi)
-
-    return str(out_png), (str(out_tif) if SAVE_GEO_TIFF else None)
-
-# ==========================
-# ========== MAIN ==========
-# ==========================
-def main():
-    if METHOD not in ("linear", "kriging"):
-        raise ValueError("METHOD debe ser 'linear' o 'kriging'")
-    if METHOD == "kriging" and not HAS_KRIGE:
-        warnings.warn("Seleccionaste 'kriging' pero PyKrige no está disponible. Se usará 'linear'.")
-
-    tasks = find_csv_tasks()
-    if not tasks:
-        print("No se encontraron CSVs que cumplan los filtros/rutas.")
+def draw_shp_lines_pyshp(m: Basemap, shp_path: Path,
+                         bbox: Tuple[float,float,float,float],
+                         linewidth: float = 0.6, color: str = "#333333",
+                         zorder: int = 7):
+    """Dibuja shapefile de líneas usando pyshp; filtra por bbox lon/lat; robusto (sin GeoPandas)."""
+    try:
+        r = shapefile.Reader(str(shp_path))
+    except Exception as e:
+        print(f"⚠ No se pudo abrir {shp_path}: {e}")
         return
 
-    mask_path, mask_mode = choose_mask_file()
-    print(f"Tareas: {len(tasks)} | Workers: {N_WORKERS}")
-    results = []
+    lon_min, lon_max, lat_min, lat_max = bbox[2], bbox[3], bbox[0], bbox[1]
+    bbox_ll = (lon_min, lat_min, lon_max, lat_max)
 
-    if N_WORKERS > 1 and len(tasks) > 1:
-        ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=N_WORKERS,
-                      initializer=_child_init,
-                      initargs=(mask_path, mask_mode),
-                      maxtasksperchild=1) as pool:
-            for r in pool.imap_unordered(process_one, tasks, chunksize=1):
-                results.append(r)
+    for sh in r.shapes():
+        if not sh.points:
+            continue
+        # bbox del shape: [xmin, ymin, xmax, ymax] en lon/lat
+        sb = tuple(sh.bbox)  # (xmin, ymin, xmax, ymax)
+        if not _bbox_intersects(sb, (bbox_ll[0], bbox_ll[1], bbox_ll[2], bbox_ll[3])):
+            continue
+
+        pts = sh.points
+        parts = list(sh.parts) + [len(pts)]
+        for i in range(len(parts)-1):
+            seg = pts[parts[i]:parts[i+1]]
+            if len(seg) < 2: continue
+            lons = np.array([p[0] for p in seg], dtype=float)
+            lats = np.array([p[1] for p in seg], dtype=float)
+            x, y = m(lons, lats)
+            good = np.isfinite(x) & np.isfinite(y)
+            if good.sum() < 2: continue
+            plt.plot(np.asarray(x)[good], np.asarray(y)[good],
+                     linewidth=linewidth, color=color, zorder=zorder)
+
+# =========================
+# INTERPOLACIÓN
+# =========================
+
+def nearest_distance_km_grid(lons_p, lats_p, LONg, LATg) -> np.ndarray:
+    """Distancia al punto de datos más cercano (km) usando cKDTree en coords lon/lat escaladas."""
+    if len(lons_p) == 0:
+        return np.full(LONg.shape, np.inf, dtype=float)
+    lat0 = np.deg2rad(np.nanmean(lats_p))
+    # Escalado equirectangular (aprox. local):
+    px = np.cos(lat0) * np.deg2rad(lons_p)
+    py = np.deg2rad(lats_p)
+    gx = np.cos(lat0) * np.deg2rad(LONg.ravel())
+    gy = np.deg2rad(LATg.ravel())
+    tree = cKDTree(np.c_[px, py])
+    d_rad, _ = tree.query(np.c_[gx, gy], k=1)
+    d_km = d_rad * 6371.0088
+    return d_km.reshape(LONg.shape)
+
+def interpolar_suave_rbf(m: Basemap, lons, lats, vals):
+    """RBF (TPS) con regularización + limitación por radio y suavizado gaussiano."""
+    # Grilla lon/lat fija (bbox fijo o derivado)
+    if USE_FIXED_BBOX:
+        lon_grid = np.linspace(GRID_LON_MIN, GRID_LON_MAX, GRID_NX)
+        lat_grid = np.linspace(GRID_LAT_MIN, GRID_LAT_MAX, GRID_NY)
     else:
-        _child_init(mask_path, mask_mode)
-        for t in tasks:
-            results.append(process_one(t))
+        lat_min, lat_max, lon_min, lon_max = compute_bounds(lats, lons, MARGEN_DEG)
+        lon_grid = np.linspace(lon_min, lon_max, GRID_NX)
+        lat_grid = np.linspace(lat_min, lat_max, GRID_NY)
 
-    print("\nArchivos generados:")
-    for png, tif in results:
-        print(f" - {png}")
-        if tif: print(f"   {tif}")
+    LONg, LATg = np.meshgrid(lon_grid, lat_grid)
+
+    # Datos válidos
+    mask_valid = np.isfinite(lons) & np.isfinite(lats) & np.isfinite(vals)
+    X = np.c_[lons[mask_valid], lats[mask_valid]]
+    y = vals[mask_valid].astype(float)
+    if X.shape[0] < 3:
+        Z = griddata(points=X, values=y, xi=(LONg, LATg), method="nearest")
+    else:
+        try:
+            rbf = RBFInterpolator(
+                X, y,
+                kernel=RBF_FUNCTION,
+                neighbors=min(RBF_NEIGHBORS, X.shape[0]),
+                smoothing=RBF_SMOOTH
+            )
+            Z = rbf(np.c_[LONg.ravel(), LATg.ravel()]).reshape(LONg.shape)
+        except Exception:
+            Z = griddata(points=X, values=y, xi=(LONg, LATg), method="linear")
+
+    # Limitar por distancia al dato más cercano
+    dmin_km = nearest_distance_km_grid(lons[mask_valid], lats[mask_valid], LONg, LATg)
+    Z = np.where(dmin_km <= RBF_MAX_RADIUS_KM, Z, np.nan)
+
+    # Suavizado gaussiano (solo donde hay datos)
+    if SUAVIZAR_GAUSS:
+        mask = np.isfinite(Z)
+        if np.any(mask):
+            Zfill = Z.copy()
+            med = np.nanmedian(Zfill[mask])
+            Zfill[~mask] = med
+            Zsmooth = gaussian_filter(Zfill, sigma=GAUSS_SIGMA)
+            Z = np.where(mask, Zsmooth, np.nan)
+
+    # Clip y máscara final
+    Z = np.clip(Z, CMAP_MIN, CMAP_MAX, out=Z, where=np.isfinite(Z))
+    Zm = np.ma.masked_invalid(Z)
+
+    XI, YI = m(LONg, LATg)
+    return XI, YI, Zm
+
+def latlon_to_rphi(lat, lon, lat0, lon0):
+    """Convierte lat/lon a coordenadas polares r (km), phi (rad) respecto a origen lat0/lon0."""
+    R = 6371.0088  # radio tierra en km
+    dlat = np.deg2rad(lat - lat0)
+    dlon = np.deg2rad(lon - lon0)
+    lat0_rad = np.deg2rad(lat0)
+    # distancia equirectangular
+    r = R * np.sqrt((dlat)**2 + (np.cos(lat0_rad)*dlon)**2)
+    phi = np.arctan2(dlat, np.cos(lat0_rad)*dlon)
+    return r, phi
+
+def rphi_to_latlon(r, phi, lat0, lon0):
+    """Convierte r (km), phi (rad) a lat/lon respecto a origen lat0/lon0."""
+    R = 6371.0088
+    lat0_rad = np.deg2rad(lat0)
+    dlat = r * np.sin(phi) / R
+    dlon = r * np.cos(phi) / (R * np.cos(lat0_rad))
+    lat = lat0 + np.rad2deg(dlat)
+    lon = lon0 + np.rad2deg(dlon)
+    return lat, lon
+
+def interpolar_suave_rphi(m, lons, lats, vals, lat0, lon0):
+    """Interpolación RBF en coordenadas polares (r, phi) respecto a origen lat0/lon0. Depuración incluida."""
+    # Convertir puntos a r, phi
+    r, phi = latlon_to_rphi(lats, lons, lat0, lon0)
+    print(f"Origen lat0, lon0: {lat0}, {lon0}")
+    print(f"Primeros puntos r: {r[:5]}, phi: {phi[:5]}")
+    # Grilla en r y phi
+    r_grid = np.linspace(0, 100, GRID_NX)  # radio hasta 100 km
+    phi_grid = np.linspace(-np.pi, np.pi, GRID_NY)
+    Rg, Pg = np.meshgrid(r_grid, phi_grid)
+    print(f"Grilla r: {r_grid[:5]} ... {r_grid[-5:]}")
+    print(f"Grilla phi: {phi_grid[:5]} ... {phi_grid[-5:]}")
+    # Interpolación
+    mask_valid = np.isfinite(r) & np.isfinite(phi) & np.isfinite(vals)
+    X = np.c_[r[mask_valid], phi[mask_valid]]
+    y = vals[mask_valid].astype(float)
+    print(f"Puntos válidos para interpolar: {X.shape[0]}")
+    if X.shape[0] < 3:
+        Z = griddata(points=X, values=y, xi=(Rg, Pg), method="nearest")
+    else:
+        try:
+            rbf = RBFInterpolator(
+                X, y,
+                kernel=RBF_FUNCTION,
+                neighbors=min(RBF_NEIGHBORS, X.shape[0]),
+                smoothing=RBF_SMOOTH
+            )
+            Z = rbf(np.c_[Rg.ravel(), Pg.ravel()]).reshape(Rg.shape)
+        except Exception as e:
+            print(f"Error RBFInterpolator: {e}")
+            Z = griddata(points=X, values=y, xi=(Rg, Pg), method="linear")
+    # Suavizado gaussiano
+    if SUAVIZAR_GAUSS:
+        mask = np.isfinite(Z)
+        if np.any(mask):
+            Zfill = Z.copy()
+            med = np.nanmedian(Zfill[mask])
+            Zfill[~mask] = med
+            Zsmooth = gaussian_filter(Zfill, sigma=GAUSS_SIGMA)
+            Z = np.where(mask, Zsmooth, np.nan)
+    # Clip y máscara final
+    Z = np.clip(Z, CMAP_MIN, CMAP_MAX, out=Z, where=np.isfinite(Z))
+    Zm = np.ma.masked_invalid(Z)
+    # Convertir grilla r, phi a lat/lon
+    lat_grid, lon_grid = rphi_to_latlon(Rg, Pg, lat0, lon0)
+    print(f"lat_grid min/max: {np.nanmin(lat_grid)}, {np.nanmax(lat_grid)}")
+    print(f"lon_grid min/max: {np.nanmin(lon_grid)}, {np.nanmax(lon_grid)}")
+    XI, YI = m(lon_grid, lat_grid)
+    print(f"XI min/max: {np.nanmin(XI)}, {np.nanmax(XI)}")
+    print(f"YI min/max: {np.nanmin(YI)}, {np.nanmax(YI)}")
+    return XI, YI, Zm
+
+# =========================
+# PUNTO ESPECIAL
+# =========================
+
+def extraer_tipo_archivo(nombre: str) -> str:
+    s = nombre.lower()
+    if "planta" in s: return "planta"
+    if "transito" in s or "tránsito" in s: return "transito"
+    return "otro"
+
+def elegir_punto_especial(nombre_archivo: str) -> Optional[Tuple[float,float,str]]:
+    """Devuelve (lat, lon, label) según nombre del archivo usando el dict 'puntos'."""
+    tipo = extraer_tipo_archivo(nombre_archivo)
+    if tipo == "planta" and "p2_planta" in puntos:
+        lat, lon = puntos["p2_planta"]["coords"]
+        return float(lat), float(lon), "p2_planta"
+    if tipo == "transito" and "p1_transito" in puntos:
+        lat, lon = puntos["p1_transito"]["coords"]
+        return float(lat), float(lon), "p1_transito"
+    return None
+
+# =========================
+# PLOTEO DE UN CSV
+# =========================
+
+def obtener_estacion_por_fecha(nombre_archivo: str) -> str:
+    """Devuelve la estación según el mes en el nombre del archivo."""
+    m = re.search(r'_(\d{4})-(\d{2})-(\d{2})_', nombre_archivo)
+    if m:
+        mes = int(m.group(2))
+        if mes == 2:
+            return "verano"
+        if mes == 8:
+            return "invierno"
+    return ""
+
+def plot_one_csv(csv_path: Path):
+    df = pd.read_csv(csv_path).dropna(subset=[LAT_COL, LON_COL, VAL_COL]).copy()
+    if df.empty:
+        print(f"✖ {csv_path.name}: sin datos válidos"); return
+
+    lats = df[LAT_COL].to_numpy(float)
+    lons = df[LON_COL].to_numpy(float)
+    vals = df[VAL_COL].to_numpy(float)
+
+    # BBox
+    if USE_FIXED_BBOX:
+        lat_min, lat_max = BBOX_LAT_MIN, BBOX_LAT_MAX
+        lon_min, lon_max = BBOX_LON_MIN, BBOX_LON_MAX
+    else:
+        lat_min, lat_max, lon_min, lon_max = compute_bounds(lats, lons, MARGEN_DEG)
+
+    # Figura y mapa
+    plt.figure(figsize=(10, 9))
+    m = build_basemap(lat_min, lat_max, lon_min, lon_max)
+    draw_base(m)
+
+    # Campo interpolado (debajo de líneas; tierra ya tapa costa)
+    pcm = None
+    if DIBUJAR_CAMPO_TL and len(vals) >= 3:
+        XI, YI, Zm = interpolar_suave_rbf(m, lons, lats, vals)
+        pcm = plt.pcolormesh(XI, YI, Zm, shading="gouraud",
+                             cmap=CMAP_NAME, vmin=CMAP_MIN, vmax=CMAP_MAX, zorder=2)
+
+    # Capas NE adicionales (líneas) con pyshp y filtro por bbox
+    bbox_ll = (lat_min, lat_max, lon_min, lon_max)
+    CAPAS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if DIBUJAR_LIMITES_PROVINCIALES:
+        shp_admin = ensure_layer(CAPAS_DIR, "admin_1_lines")
+        if shp_admin:
+            draw_shp_lines_pyshp(m, shp_admin, bbox_ll, linewidth=0.7, color="#555555", zorder=8)
+
+    if DIBUJAR_RUTAS:
+        shp_roads = ensure_layer(CAPAS_DIR, "roads")
+        if shp_roads:
+            draw_shp_lines_pyshp(m, shp_roads, bbox_ll, linewidth=0.6, color="#8B4513", zorder=9)  # marrón
+
+    if DIBUJAR_RIOS:
+        shp_riv = ensure_layer(CAPAS_DIR, "rivers")
+        if shp_riv:
+            draw_shp_lines_pyshp(m, shp_riv, bbox_ll, linewidth=0.6, color="#1f77b4", zorder=9)
+
+    # Ciudades (encima)
+    if DIBUJAR_CIUDADES:
+        for name, lat, lon in CUSTOM_PLACES:
+            x, y = m(lon, lat)
+            plt.plot([x],[y], marker="o", ms=10, mfc="#222222", mec="#FFFFFF", mew=0.6, zorder=12)
+            if name in ["Bahía Creek", "La Ensenada"]:
+                plt.text(x-6000, y+14000, name, fontsize=14, color="#111",
+                         ha="left", va="top", zorder=12)
+            else:
+                plt.text(x-6000, y+6000, name, fontsize=14, color="#111",
+                         ha="right", va="top", zorder=12)
+
+    # Punto especial (encima)
+    if DIBUJAR_PUNTO_ESPECIAL:
+        pe = elegir_punto_especial(csv_path.name)
+        if pe is not None:
+            pe_lon, pe_lat, pe_label = pe
+            color = PUNTO_FACE_DEFAULT
+            # usar color del dict si existe
+            if pe_label == "Planta":
+                color = puntos["p2_planta"].get("color", color)
+            elif pe_label == "Tránsito":
+                color = puntos["p1_transito"].get("color", color)
+            px, py = m(pe_lon, pe_lat)
+            plt.plot(px, py, marker=PUNTO_MARKER, ms=PUNTO_MS,
+                     mfc=color, mec=PUNTO_EDGE, mew=1.4, zorder=12)
+            # etiqueta a la izquierda del marcador
+            plt.text(px-6000, py, pe_label, fontsize=9, color="#111", ha="right", va="center", zorder=12)
+
+    # Dibuja todos los puntos definidos en el vector 'puntos' sobre el mapa
+    for nombre, info in puntos.items():
+        lat, lon = info["coords"]
+        color = info.get("color", PUNTO_FACE_DEFAULT)
+        px, py = m(lon, lat)
+        plt.plot(px, py, marker=PUNTO_MARKER, ms=PUNTO_MS,
+                 mfc=color, mec=PUNTO_EDGE, mew=1.4, zorder=13)
+        plt.text(px-6000, py, nombre, fontsize=14, color="#111", ha="right", va="center", zorder=13)
+
+    # Puntos medidos (apagados por defecto)
+    sc = None
+    if DIBUJAR_PUNTOS_TL:
+        x, y = m(lons, lats)
+        sc = plt.scatter(x, y, c=np.clip(vals, CMAP_MIN, CMAP_MAX),
+                         s=DATA_SCATTER_S, cmap=CMAP_NAME,
+                         vmin=CMAP_MIN, vmax=CMAP_MAX,
+                         marker=DATA_MARKER, edgecolors="none", zorder=11)
+
+    # Grilla arriba de todo
+    draw_grid_top(m)
+
+    # Colorbar vertical con título horizontal
+    mappable = pcm if (pcm is not None) else sc
+    if mappable is not None:
+        cbar = plt.colorbar(mappable, orientation="vertical", pad=0.02, shrink=0.85)
+        cbar.mappable.set_clim(CMAP_MIN, CMAP_MAX)
+        cbar.update_normal(cbar.mappable)
+        cbar.ax.set_xlabel("TL(dB)", labelpad=8, loc="right")
+        label = cbar.ax.xaxis.get_label()
+        label.set_x(4.0)  # Ajusta el valor para mover el texto más a la derecha
+
+    # Título
+    fname = csv_path.name
+    fdate = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
+    fstr  = re.search(r"f=(\d{1,4}(?:[.,]\d+)?)\s*Hz", fname, re.IGNORECASE)
+    date_str = fdate.group(1) if fdate else ""
+    freq_str = (fstr.group(1).replace(",", ".")+" Hz") if fstr else "100 Hz"
+    estacion = obtener_estacion_por_fecha(csv_path.name)
+    plt.title(f"Pérdidas por transmisión — TL_min, f = {freq_str}, estación: {estacion}", pad=30)
+
+    # Etiquetas de coordenadas lat/lon más grandes
+    ax = plt.gca()
+    ax.tick_params(axis='both', which='major', labelsize=22)
+    plt.subplots_adjust(left=0.12, right=0.95, top=0.92, bottom=0.10)
+
+    # Guardar
+    out_path = MAPAS_DIR / (csv_path.stem + "_map.png")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=DPI)
+    plt.close()
+    print(f"✔ Figura guardada en {out_path}")
+
+# =========================
+# MAIN
+# =========================
+
+def process_csv(csv):
+    plot_one_csv(Path(csv))
+
+def main():
+    plt.rcParams.update({'font.size': 16})
+    with mp.Pool(mp.cpu_count()) as pool:
+        pool.map(process_csv, CSV_LIST)
 
 if __name__ == "__main__":
     main()
