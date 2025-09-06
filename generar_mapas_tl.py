@@ -44,7 +44,9 @@ CSV_LIST = sorted(glob.glob("input-data/gsm-*.csv"))
 MAPAS_DIR = Path("mapas")
 MAPAS_DIR.mkdir(parents=True, exist_ok=True)
 
+
 # Columnas
+# VAL_COL puede ser: tl_20m, tl_40m, tl_z_half, tl_zmin
 LAT_COL = "lat"
 LON_COL = "lon"
 VAL_COL = "tl_zmin"
@@ -150,7 +152,7 @@ NATURAL_EARTH_LAYERS: Dict[str, Dict[str, str]] = {
         "shp": "ne_10m_rivers_lake_centerlines.shp",
     },
 }
-CAPAS_DIR = Path("test/Capas")
+CAPAS_DIR = Path("Capas")
 
 DPI = 300
 
