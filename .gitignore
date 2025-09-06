@@ -7,14 +7,14 @@ venv/
 .env/
 
 # Shapefiles y datos pesados de Natural Earth
-*.zip
-*.shp
-*.shx
-*.dbf
-*.prj
-*.cpg
-*.qpj
+#.zip
+#*.shp
+#*.shx
+#.dbf
+#*.prj
+#*.cpg
+#*.qpj
 
 # Salidas gráficas/CSVs
-*.png
-*.csv
+#*.png
+#*.csv
