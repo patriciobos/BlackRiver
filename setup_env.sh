@@ -57,33 +57,17 @@ fi
 echo "▶ Actualizando pip/setuptools/wheel en el venv ..."
 "$VPY" -m pip install --upgrade pip setuptools wheel
 
-# 5) Instalar dependencias dentro del venv (versiones probadas con Python 3.10.12)
-echo "▶ Instalando dependencias del proyecto en el venv ..."
-# ...
-"$VPIP" install \
-  numpy==1.26.4 \
-  pandas==2.2.2 \
-  scipy==1.13.1 \
-  matplotlib==3.9.0 \
-  geopandas==0.14.4 \
-  shapely==2.0.4 \
-  pyproj==3.6.1 \
-  rasterio==1.3.10 \
-  cartopy==0.22.0 \
-  pykrige==1.7.1 \
-  rtree==1.3.0 \
-  scikit-learn==1.5.1 \
-  tqdm==4.66.4
-# ...
 
+# 5) Instalar dependencias dentro del venv usando requirements.txt
+echo "▶ Instalando dependencias del proyecto desde requirements.txt ..."
+if [ -f requirements.txt ]; then
+  "$VPIP" install -r requirements.txt
+else
+  echo "❌ No se encontró requirements.txt. Por favor crea el archivo con las dependencias necesarias."
+  exit 1
+fi
 
-
-# 6) requirements.txt desde el venv
-echo "▶ Generando requirements.txt ..."
-"$VPIP" freeze > requirements.txt
-echo "✓ requirements.txt creado."
-
-# 7) Mensaje final
+# 6) Mensaje final
 if is_sourced; then
   echo
   echo "🎉 Entorno listo y ACTIVADO en esta shell."
