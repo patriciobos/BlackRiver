@@ -1,0 +1,6 @@
+Categoria_usuario,Categoria_Jensen,Porosidad_p_%,Densidad_rel_agua,cp_m_s,cs_m_s,Atenuacion_cp_dB_lambda,Atenuacion_cs_dB_lambda
+Arena,Sand,45,1.9,1650,~110·z^0.3,0.8,2.5
+Arena limosa,Sand,45,1.9,1650,~110·z^0.3,0.8,2.5
+Limo,Silt,55,1.7,1575,~80·z^0.3,1.0,1.5
+Grava arenosa,Gravel,35,2.0,1800,~180·z^0.3,0.6,1.5
+Grava con cochinillas (bioclástica),Gravel,35,2.0,1800,~180·z^0.3,0.6,1.5
