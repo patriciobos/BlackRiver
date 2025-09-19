@@ -32,6 +32,8 @@ from scipy.ndimage import gaussian_filter
 
 import multiprocessing as mp
 import glob
+from pathlib import Path
+import re
 
 # =========================
 # CONFIGURACIÓN (editar acá)
@@ -52,10 +54,24 @@ LON_COL = "lon"
 VAL_COL = "tl_zmin"
 
 # Mostrar/ocultar capas
-DIBUJAR_CAMPO_TL  = True     # interpolación
-DIBUJAR_PUNTOS_TL = False    # datapoints medidos (apagado)
+DIBUJAR_CAMPO_TL = False  # interpolación
+DIBUJAR_PUNTOS_TL = True    # datapoints medidos (apagado)
 DIBUJAR_CIUDADES  = True
 DIBUJAR_PUNTO_ESPECIAL = True
+
+BASE_DIR = Path(__file__).resolve().parent  # o Path.cwd() si prefieres
+
+# Regla: si ambos True -> "mapas"; si solo PUNTOS -> "mapas_rayos"; si ninguno -> None
+if DIBUJAR_CAMPO_TL:
+    MAPAS_DIR = BASE_DIR / "mapas"          # prioridad cuando ambos son True
+elif DIBUJAR_PUNTOS_TL:
+    MAPAS_DIR = BASE_DIR / "mapas_rayos"
+else:
+    MAPAS_DIR = None
+
+# crea la carpeta si aplica
+if MAPAS_DIR is not None:
+    MAPAS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Capas vectoriales Natural Earth (todas activadas por defecto)
 DIBUJAR_LIMITES_PROVINCIALES = True
@@ -70,7 +86,7 @@ puntos: Dict[str, Dict[str, object]] = {
 
 # Estilo
 CMAP_NAME = "jet_r"
-CMAP_MIN, CMAP_MAX = 50.0, 220.0
+CMAP_MIN, CMAP_MAX = 5.0, 200.0
 SEA_COLOR   = "#CFEFFF"
 LAND_COLOR  = "#E6E6E6"
 COAST_COLOR = "#222222"
@@ -78,7 +94,7 @@ COUNTRY_COLOR = "#444444"
 GRID_COLOR  = "#777777"
 
 DATA_MARKER = "^"
-DATA_SIZE_PT = 10
+DATA_SIZE_PT = 10  # Reducido de 10 a 5 para markers más pequeños
 DATA_SCATTER_S = DATA_SIZE_PT**2
 
 PUNTO_MARKER = "^"
@@ -104,13 +120,13 @@ GRID_NY = 350
 
 # Interpolación suave (RBF) + suavizado final
 RBF_FUNCTION = "thin_plate_spline"   # suave y continuo
-RBF_SMOOTH   = 100.0                 # regularización (↑ = mucho más suave)
+RBF_SMOOTH   = 0.0                 # regularización (↑ = mucho más suave)
 RBF_NEIGHBORS = 100                  # más vecinos para suavizar
 RBF_MAX_RADIUS_KM = 100.0            # descartar > radio desde el dato más cercano
 
 # Suavizado gaussiano post-interpolación (en celdas de la grilla)
-SUAVIZAR_GAUSS = True
-GAUSS_SIGMA = 4.0                    # suavizado gaussiano fuerte
+SUAVIZAR_GAUSS = False
+GAUSS_SIGMA = 2.0                    # suavizado gaussiano fuerte 4.0, suave 2.0
 
 # Ciudades del GSM (etiqueta a la izquierda del marcador)
 CUSTOM_PLACES: List[Tuple[str, float, float]] = [
@@ -159,6 +175,90 @@ DPI = 300
 # =========================
 # HELPERS
 # =========================
+
+# --- DROP-IN: limpiar tl_zmin y normalizar robusto --------------------------
+from matplotlib.colors import Normalize, LogNorm
+
+def prepare_tl_zmin(
+    df: pd.DataFrame,
+    col: str = "tl_zmin",
+    out_col: str = "tl_zmin_clean",
+    clip_neg: bool = True,
+    fix_decimal_shift: bool = True,
+    decimal_divisor: int = 1000,
+) -> pd.DataFrame:
+    """
+    Limpia la columna `col`:
+      - normaliza comas/puntos
+      - elimina basura no numérica
+      - corrige enteros largos (p.ej. 35696 -> 35.696) dividiendo por `decimal_divisor`
+      - opcionalmente recorta negativos a 0
+    Escribe resultado en `out_col` y devuelve el mismo df (no rompe el resto).
+    """
+    s_raw = df[col].astype(str).str.replace(",", ".", regex=False).str.strip()
+    s_raw = s_raw.str.replace(r"[^0-9\.\-]", "", regex=True)  # deja solo dígitos, punto y signo
+    v = pd.to_numeric(s_raw, errors="coerce")
+
+    if fix_decimal_shift:
+        # Heurística: enteros de 4+ dígitos SIN punto y muy grandes -> estaban en milésimas
+        no_dot   = ~s_raw.str.contains(r"\.")
+        long_int = s_raw.str.match(r"^\-?\d{4,}$")
+        big      = v.abs() > 300
+        fix_mask = no_dot & long_int & big
+        v.loc[fix_mask] = v.loc[fix_mask] / float(decimal_divisor)
+
+    if clip_neg:
+        v = v.clip(lower=0)
+
+    df[out_col] = v
+    return df
+
+def robust_norm(series: pd.Series, q_low: float = 0.02, q_high: float = 0.98, log: bool = False):
+    """
+    Devuelve un Normalize (o LogNorm) usando cuantiles para ignorar outliers.
+    No modifica nada fuera de esto.
+    """
+    s = pd.to_numeric(series, errors="coerce").dropna().values
+    if s.size == 0:
+        return Normalize(vmin=0.0, vmax=1.0)
+
+    vmin = float(np.nanquantile(s, q_low))
+    vmax = float(np.nanquantile(s, q_high))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin = float(np.nanmin(s))
+        vmax = float(np.nanmax(s))
+        if vmin == vmax:
+            vmax = vmin + 1e-6
+
+    if log:
+        vmin = max(vmin, 1e-9)
+        return LogNorm(vmin=vmin, vmax=vmax)
+    return Normalize(vmin=vmin, vmax=vmax)
+# ---------------------------------------------------------------------------
+
+# USO mínimo (no rompe nada existente):
+# prepare_tl_zmin(df)                  # crea df['tl_zmin_clean'] sin tocar df['tl_zmin']
+# VAL_COL = "tl_zmin_clean"            # usá esta col para colorear
+
+# 1) Si graficás con matplotlib (pcolormesh/imshow/scatter):
+# norm = robust_norm(df[VAL_COL], q_low=0.02, q_high=0.98, log=False)
+# ej:
+# plt.pcolormesh(X, Y, Z, cmap="turbo", norm=norm); plt.colorbar(label=VAL_COL)
+
+# 2) Si graficás con GeoPandas .plot():
+# gdf.plot(column=VAL_COL, cmap="turbo", vmin=norm.vmin, vmax=norm.vmax, legend=True)
+
+def invertir_planta_transito(nombre: str) -> str:
+    """
+    Intercambia 'planta' ↔ 'transito' en un nombre de archivo.
+    Maneja también 'tránsito' con acento y es case-insensitive.
+    Nota: en la salida uso 'transito' sin acento (más seguro para nombres de archivo).
+    """
+    s = nombre
+    s = re.sub(r"(?i)tr[áa]nsito", "__TMP_TRANSITO__", s)  # marca tránsito
+    s = re.sub(r"(?i)planta", "transito", s)               # planta -> transito
+    s = s.replace("__TMP_TRANSITO__", "planta")            # tránsito -> planta
+    return s
 
 def ensure_layer(capas_dir: Path, layer_key: str) -> Optional[Path]:
     info = NATURAL_EARTH_LAYERS[layer_key]
@@ -312,23 +412,27 @@ def interpolar_suave_rbf(m: Basemap, lons, lats, vals):
     mask_valid = np.isfinite(lons) & np.isfinite(lats) & np.isfinite(vals)
     X = np.c_[lons[mask_valid], lats[mask_valid]]
     y = vals[mask_valid].astype(float)
-    if X.shape[0] < 3:
-        Z = griddata(points=X, values=y, xi=(LONg, LATg), method="nearest")
-    else:
-        try:
-            rbf = RBFInterpolator(
-                X, y,
-                kernel=RBF_FUNCTION,
-                neighbors=min(RBF_NEIGHBORS, X.shape[0]),
-                smoothing=RBF_SMOOTH
-            )
-            Z = rbf(np.c_[LONg.ravel(), LATg.ravel()]).reshape(LONg.shape)
-        except Exception:
-            Z = griddata(points=X, values=y, xi=(LONg, LATg), method="linear")
+    # if X.shape[0] < 3:
+    #     Z = griddata(points=X, values=y, xi=(LONg, LATg), method="nearest")
+    # else:
+    #     try:
+    #         rbf = RBFInterpolator(
+    #             X, y,
+    #             kernel=RBF_FUNCTION,
+    #             neighbors=min(RBF_NEIGHBORS, X.shape[0]),
+    #             smoothing=RBF_SMOOTH
+    #         )
+    #         Z = rbf(np.c_[LONg.ravel(), LATg.ravel()]).reshape(LONg.shape)
+    #     except Exception:
+    #         Z = griddata(points=X, values=y, xi=(LONg, LATg), method="linear")
 
-    # Limitar por distancia al dato más cercano
-    dmin_km = nearest_distance_km_grid(lons[mask_valid], lats[mask_valid], LONg, LATg)
-    Z = np.where(dmin_km <= RBF_MAX_RADIUS_KM, Z, np.nan)
+    # # Limitar por distancia al dato más cercano
+    # dmin_km = nearest_distance_km_grid(lons[mask_valid], lats[mask_valid], LONg, LATg)
+    # Z = np.where(dmin_km <= RBF_MAX_RADIUS_KM, Z, np.nan)
+
+    # Interpolación SIN suavizado: vecino más cercano (bloques, sin alisado)
+    Z = griddata(points=X, values=y, xi=(LONg, LATg), method="linear")
+
 
     # Suavizado gaussiano (solo donde hay datos)
     if SUAVIZAR_GAUSS:
@@ -426,8 +530,11 @@ def interpolar_suave_rphi(m, lons, lats, vals, lat0, lon0):
 
 def extraer_tipo_archivo(nombre: str) -> str:
     s = nombre.lower()
-    if "planta" in s: return "planta"
-    if "transito" in s or "tránsito" in s: return "transito"
+    # Invertido: si el archivo dice "planta" en realidad es "transito", y viceversa
+    if "planta" in s: 
+        return "transito"
+    if "transito" in s or "tránsito" in s: 
+        return "planta"
     return "otro"
 
 def elegir_punto_especial(nombre_archivo: str) -> Optional[Tuple[float,float,str]]:
@@ -461,9 +568,11 @@ def plot_one_csv(csv_path: Path):
     if df.empty:
         print(f"✖ {csv_path.name}: sin datos válidos"); return
 
+    # Limpiar y crear columna tl_zmin_clean
+    prepare_tl_zmin(df)
     lats = df[LAT_COL].to_numpy(float)
     lons = df[LON_COL].to_numpy(float)
-    vals = df[VAL_COL].to_numpy(float)
+    vals = df["tl_zmin_clean"].to_numpy(float)
 
     # BBox
     if USE_FIXED_BBOX:
@@ -545,7 +654,7 @@ def plot_one_csv(csv_path: Path):
     sc = None
     if DIBUJAR_PUNTOS_TL:
         x, y = m(lons, lats)
-        sc = plt.scatter(x, y, c=np.clip(vals, CMAP_MIN, CMAP_MAX),
+        sc = plt.scatter(x, y, c=vals,
                          s=DATA_SCATTER_S, cmap=CMAP_NAME,
                          vmin=CMAP_MIN, vmax=CMAP_MAX,
                          marker=DATA_MARKER, edgecolors="none", zorder=11)
@@ -564,7 +673,10 @@ def plot_one_csv(csv_path: Path):
         label.set_x(4.0)  # Ajusta el valor para mover el texto más a la derecha
 
     # Título
-    fname = csv_path.name
+    # antes:
+    # fname = csv_path.name
+    fname = invertir_planta_transito(csv_path.name)
+
     fdate = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
     fstr  = re.search(r"f=(\d{1,4}(?:[.,]\d+)?)\s*Hz", fname, re.IGNORECASE)
     date_str = fdate.group(1) if fdate else ""
@@ -578,7 +690,9 @@ def plot_one_csv(csv_path: Path):
     plt.subplots_adjust(left=0.12, right=0.95, top=0.92, bottom=0.10)
 
     # Guardar
-    out_path = MAPAS_DIR / (csv_path.stem + "_map.png")
+    # antes:
+    # out_path = MAPAS_DIR / (csv_path.stem + "_map.png")
+    out_path = MAPAS_DIR / (invertir_planta_transito(csv_path.stem) + "_map.png")
     plt.tight_layout()
     plt.savefig(out_path, dpi=DPI)
     plt.close()
