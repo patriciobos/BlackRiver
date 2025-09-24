@@ -682,7 +682,7 @@ def plot_one_csv(csv_path: Path):
             label.set_x(4.0)  # Ajusta el valor para mover el texto más a la derecha
 
         # Título
-        fname = invertir_planta_transito(csv_path.name)
+        fname = csv_path.stem  # Usar el nombre real, sin invertir
         fdate = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
         fstr  = re.search(r"f=(\d{1,4}(?:[.,]\d+)?)\s*Hz", fname, re.IGNORECASE)
         date_str = fdate.group(1) if fdate else ""
@@ -696,7 +696,7 @@ def plot_one_csv(csv_path: Path):
         plt.subplots_adjust(left=0.12, right=0.95, top=0.92, bottom=0.10)
 
         # Guardar
-        out_path = MAPAS_DIR / (invertir_planta_transito(csv_path.stem) + f"_{VAL_COL}_map.png")
+        out_path = MAPAS_DIR / (csv_path.stem + f"_{VAL_COL}_map.png")
         plt.tight_layout()
         plt.savefig(out_path, dpi=DPI)
         plt.close()
