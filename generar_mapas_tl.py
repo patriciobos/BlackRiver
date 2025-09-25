@@ -56,8 +56,8 @@ LON_COL = "lon"
 VAL_COL_LIST = ["tl_zmin", "tl_20m", "tl_40m", "tl_z_half"]  # Puedes agregar más columnas aquí, ej: ["tl_zmin", "tl_20m"]
 
 # Mostrar/ocultar capas
-DIBUJAR_CAMPO_TL = False      # Nuevo flag para mapas interpolados
-DIBUJAR_PUNTOS_TL = True    # datapoints medidos (apagado)
+DIBUJAR_CAMPO_TL = True      # Nuevo flag para mapas interpolados
+DIBUJAR_PUNTOS_TL = False    # datapoints medidos (apagado)
 DIBUJAR_CIUDADES  = True
 DIBUJAR_PUNTO_ESPECIAL = True
 
