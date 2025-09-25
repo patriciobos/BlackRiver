@@ -56,20 +56,17 @@ LON_COL = "lon"
 VAL_COL_LIST = ["tl_zmin", "tl_20m", "tl_40m", "tl_z_half"]  # Puedes agregar más columnas aquí, ej: ["tl_zmin", "tl_20m"]
 
 # Mostrar/ocultar capas
-DIBUJAR_CAMPO_TL = True  # interpolación
-DIBUJAR_PUNTOS_TL = False    # datapoints medidos (apagado)
+DIBUJAR_CAMPO_TL = False      # Nuevo flag para mapas interpolados
+DIBUJAR_PUNTOS_TL = True    # datapoints medidos (apagado)
 DIBUJAR_CIUDADES  = True
 DIBUJAR_PUNTO_ESPECIAL = True
 
-BASE_DIR = Path(__file__).resolve().parent  # o Path.cwd() si prefieres
+BASE_DIR = Path(__file__).resolve().parent
 
-# Regla: si ambos True -> "mapas"; si solo PUNTOS -> "mapas_rayos"; si ninguno -> None
-if DIBUJAR_CAMPO_TL:
-    MAPAS_DIR = BASE_DIR / "mapas"          # prioridad cuando ambos son True
-elif DIBUJAR_PUNTOS_TL:
-    MAPAS_DIR = BASE_DIR / "mapas_rayos"
-else:
-    MAPAS_DIR = None
+# --- No más flag DIBUJAR_CAMPO_TL, siempre se genera campo interpolado ---
+# Las carpetas de salida se definen por variable TL y tipo de mapa
+MAPAS_DIR_BASE = BASE_DIR / "mapas"
+MAPAS_RAYOS_DIR_BASE = BASE_DIR / "mapas_rayos"
 
 # crea la carpeta si aplica
 if MAPAS_DIR is not None:
@@ -236,25 +233,13 @@ def robust_norm(series: pd.Series, q_low: float = 0.02, q_high: float = 0.98, lo
         vmin = max(vmin, 1e-9)
         return LogNorm(vmin=vmin, vmax=vmax)
     return Normalize(vmin=vmin, vmax=vmax)
-# ---------------------------------------------------------------------------
 
-# USO mínimo (no rompe nada existente):
-# prepare_tl_zmin(df)                  # crea df['tl_zmin_clean'] sin tocar df['tl_zmin']
-# VAL_COL = "tl_zmin_clean"            # usá esta col para colorear
-
-# 1) Si graficás con matplotlib (pcolormesh/imshow/scatter):
-# norm = robust_norm(df[VAL_COL], q_low=0.02, q_high=0.98, log=False)
-# ej:
-# plt.pcolormesh(X, Y, Z, cmap="turbo", norm=norm); plt.colorbar(label=VAL_COL)
-
-# 2) Si graficás con GeoPandas .plot():
-# gdf.plot(column=VAL_COL, cmap="turbo", vmin=norm.vmin, vmax=norm.vmax, legend=True)
-
+# Deprecated, Rui ya corrigió el error en los CSVs
 def invertir_planta_transito(nombre: str) -> str:
     """
     Intercambia 'planta' ↔ 'transito' en un nombre de archivo.
     Maneja también 'tránsito' con acento y es case-insensitive.
-    Nota: en la salida uso 'transito' sin acento (más seguro para nombres de archivo).
+    Nota: en la salida se usa 'transito' sin acento (más seguro para nombres de archivo).
     """
     s = nombre
     s = re.sub(r"(?i)tr[áa]nsito", "__TMP_TRANSITO__", s)  # marca tránsito
@@ -332,6 +317,10 @@ def draw_grid_top(m: Basemap):
 def annotate_custom_places(m: Basemap):
     for name, lat, lon in CUSTOM_PLACES:
         x, y = m(lon, lat)
+        if isinstance(x, (np.ndarray, list)):
+            x = float(np.atleast_1d(x)[0])
+        if isinstance(y, (np.ndarray, list)):
+            y = float(np.atleast_1d(y)[0])
         plt.plot([x],[y], marker="o", ms=10, mfc="#222222", mec="#FFFFFF", mew=0.6, zorder=12)
         plt.text(x-6000, y, name, fontsize=8, color="#111",
                  ha="right", va="center", zorder=12)
@@ -543,10 +532,18 @@ def elegir_punto_especial(nombre_archivo: str) -> Optional[Tuple[float,float,str
     """Devuelve (lat, lon, label) según nombre del archivo usando el dict 'puntos'."""
     tipo = extraer_tipo_archivo(nombre_archivo)
     if tipo == "planta" and "p2_planta" in puntos:
-        lat, lon = puntos["p2_planta"]["coords"]
+        coords = puntos["p2_planta"].get("coords", (None, None))
+        if not (isinstance(coords, (tuple, list)) and len(coords) == 2):
+            print(f"Advertencia: coords inválido para 'p2_planta': {coords}")
+            return None
+        lat, lon = coords
         return float(lat), float(lon), "p2_planta"
     if tipo == "transito" and "p1_transito" in puntos:
-        lat, lon = puntos["p1_transito"]["coords"]
+        coords = puntos["p1_transito"].get("coords", (None, None))
+        if not (isinstance(coords, (tuple, list)) and len(coords) == 2):
+            print(f"Advertencia: coords inválido para 'p1_transito': {coords}")
+            return None
+        lat, lon = coords
         return float(lat), float(lon), "p1_transito"
     return None
 
@@ -566,6 +563,9 @@ def obtener_estacion_por_fecha(nombre_archivo: str) -> str:
     return ""
 
 def plot_one_csv(csv_path: Path):
+    if not DIBUJAR_CAMPO_TL and not DIBUJAR_PUNTOS_TL:
+        print(f"No se generarán mapas para {csv_path.name} porque ambos flags están en False.")
+        return
     df = pd.read_csv(csv_path).copy()
     for VAL_COL in VAL_COL_LIST:
         if VAL_COL not in df.columns:
@@ -590,118 +590,214 @@ def plot_one_csv(csv_path: Path):
         else:
             lat_min, lat_max, lon_min, lon_max = compute_bounds(lats, lons, MARGEN_DEG)
 
-        # Figura y mapa
-        plt.figure(figsize=(10, 9))
-        m = build_basemap(lat_min, lat_max, lon_min, lon_max)
-        draw_base(m)
+        # --- Campo interpolado: solo si DIBUJAR_CAMPO_TL ---
+        if DIBUJAR_CAMPO_TL:
+            out_dir = MAPAS_DIR_BASE / VAL_COL
+            out_dir.mkdir(parents=True, exist_ok=True)
+            plt.figure(figsize=(10, 9))
+            m = build_basemap(lat_min, lat_max, lon_min, lon_max)
+            draw_base(m)
+            pcm = None
+            if len(vals) >= 3:
+                XI, YI, Zm = interpolar_suave_rbf(m, lons, lats, vals)
+                pcm = plt.pcolormesh(XI, YI, Zm, shading="gouraud",
+                                     cmap=CMAP_NAME, vmin=CMAP_MIN, vmax=CMAP_MAX, zorder=2)
+            # Grilla de coordenadas (lat/lon)
+            draw_grid_top(m)
+            # Capas NE adicionales (líneas) con pyshp y filtro por bbox
+            bbox_ll = (lat_min, lat_max, lon_min, lon_max)
+            CAPAS_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Campo interpolado (debajo de líneas; tierra ya tapa costa)
-        pcm = None
-        if DIBUJAR_CAMPO_TL and len(vals) >= 3:
-            XI, YI, Zm = interpolar_suave_rbf(m, lons, lats, vals)
-            pcm = plt.pcolormesh(XI, YI, Zm, shading="gouraud",
-                                 cmap=CMAP_NAME, vmin=CMAP_MIN, vmax=CMAP_MAX, zorder=2)
+            if DIBUJAR_LIMITES_PROVINCIALES:
+                shp_admin = ensure_layer(CAPAS_DIR, "admin_1_lines")
+                if shp_admin:
+                    draw_shp_lines_pyshp(m, shp_admin, bbox_ll, linewidth=0.7, color="#555555", zorder=8)
 
-        # Capas NE adicionales (líneas) con pyshp y filtro por bbox
-        bbox_ll = (lat_min, lat_max, lon_min, lon_max)
-        CAPAS_DIR.mkdir(parents=True, exist_ok=True)
+            if DIBUJAR_RUTAS:
+                shp_roads = ensure_layer(CAPAS_DIR, "roads")
+                if shp_roads:
+                    draw_shp_lines_pyshp(m, shp_roads, bbox_ll, linewidth=0.6, color="#8B4513", zorder=9)  # marrón
 
-        if DIBUJAR_LIMITES_PROVINCIALES:
-            shp_admin = ensure_layer(CAPAS_DIR, "admin_1_lines")
-            if shp_admin:
-                draw_shp_lines_pyshp(m, shp_admin, bbox_ll, linewidth=0.7, color="#555555", zorder=8)
+            if DIBUJAR_RIOS:
+                shp_riv = ensure_layer(CAPAS_DIR, "rivers")
+                if shp_riv:
+                    draw_shp_lines_pyshp(m, shp_riv, bbox_ll, linewidth=0.6, color="#1f77b4", zorder=9)
 
-        if DIBUJAR_RUTAS:
-            shp_roads = ensure_layer(CAPAS_DIR, "roads")
-            if shp_roads:
-                draw_shp_lines_pyshp(m, shp_roads, bbox_ll, linewidth=0.6, color="#8B4513", zorder=9)  # marrón
+            # Ciudades (encima)
+            if DIBUJAR_CIUDADES:
+                for name, lat, lon in CUSTOM_PLACES:
+                    x, y = m(lon, lat)
+                    if isinstance(x, (np.ndarray, list)):
+                        x = float(np.atleast_1d(x)[0])
+                    if isinstance(y, (np.ndarray, list)):
+                        y = float(np.atleast_1d(y)[0])
+                    plt.plot([x],[y], marker="o", ms=10, mfc="#222222", mec="#FFFFFF", mew=0.6, zorder=12)
+                    if name in ["Bahía Creek", "La Ensenada"]:
+                        plt.text(x-6000, y+14000, name, fontsize=14, color="#111",
+                                 ha="left", va="top", zorder=12)
+                    else:
+                        plt.text(x-6000, y+6000, name, fontsize=14, color="#111",
+                                 ha="right", va="top", zorder=12)
 
-        if DIBUJAR_RIOS:
-            shp_riv = ensure_layer(CAPAS_DIR, "rivers")
-            if shp_riv:
-                draw_shp_lines_pyshp(m, shp_riv, bbox_ll, linewidth=0.6, color="#1f77b4", zorder=9)
+            # Punto especial (encima)
+            if DIBUJAR_PUNTO_ESPECIAL:
+                pe = elegir_punto_especial(csv_path.name)
+                if pe is not None:
+                    pe_lon, pe_lat, pe_label = pe
+                    color = PUNTO_FACE_DEFAULT
+                    if pe_label == "Planta":
+                        color = puntos["p2_planta"].get("color", color)
+                    elif pe_label == "Tránsito":
+                        color = puntos["p1_transito"].get("color", color)
+                    px, py = m(pe_lon, pe_lat)
+                    if isinstance(px, (np.ndarray, list)):
+                        px = float(np.atleast_1d(px)[0])
+                    if isinstance(py, (np.ndarray, list)):
+                        py = float(np.atleast_1d(py)[0])
+                    plt.plot(px, py, marker=PUNTO_MARKER, ms=PUNTO_MS,
+                             mfc=color, mec=PUNTO_EDGE, mew=1.4, zorder=12)
+                    plt.text(px-6000, py, pe_label, fontsize=9, color="#111", ha="right", va="center", zorder=12)
 
-        # Ciudades (encima)
-        if DIBUJAR_CIUDADES:
-            for name, lat, lon in CUSTOM_PLACES:
-                x, y = m(lon, lat)
-                plt.plot([x],[y], marker="o", ms=10, mfc="#222222", mec="#FFFFFF", mew=0.6, zorder=12)
-                if name in ["Bahía Creek", "La Ensenada"]:
-                    plt.text(x-6000, y+14000, name, fontsize=14, color="#111",
-                             ha="left", va="top", zorder=12)
-                else:
-                    plt.text(x-6000, y+6000, name, fontsize=14, color="#111",
-                             ha="right", va="top", zorder=12)
-
-        # Punto especial (encima)
-        if DIBUJAR_PUNTO_ESPECIAL:
-            pe = elegir_punto_especial(csv_path.name)
-            if pe is not None:
-                pe_lon, pe_lat, pe_label = pe
-                color = PUNTO_FACE_DEFAULT
-                # usar color del dict si existe
-                if pe_label == "Planta":
-                    color = puntos["p2_planta"].get("color", color)
-                elif pe_label == "Tránsito":
-                    color = puntos["p1_transito"].get("color", color)
-                px, py = m(pe_lon, pe_lat)
+            for nombre, info in puntos.items():
+                coords = info.get("coords", (None, None))
+                if not (isinstance(coords, (tuple, list)) and len(coords) == 2):
+                    print(f"Advertencia: coords inválido para '{nombre}': {coords}")
+                    continue
+                lat, lon = coords
+                color = info.get("color", PUNTO_FACE_DEFAULT)
+                px, py = m(lon, lat)
+                if isinstance(px, (np.ndarray, list)):
+                    px = float(np.atleast_1d(px)[0])
+                if isinstance(py, (np.ndarray, list)):
+                    py = float(np.atleast_1d(py)[0])
                 plt.plot(px, py, marker=PUNTO_MARKER, ms=PUNTO_MS,
-                         mfc=color, mec=PUNTO_EDGE, mew=1.4, zorder=12)
-                # etiqueta a la izquierda del marcador
-                plt.text(px-6000, py, pe_label, fontsize=9, color="#111", ha="right", va="center", zorder=12)
+                         mfc=color, mec=PUNTO_EDGE, mew=1.4, zorder=13)
+                plt.text(px-6000, py, nombre, fontsize=14, color="#111", ha="right", va="center", zorder=13)
 
-        # Dibuja todos los puntos definidos en el vector 'puntos' sobre el mapa
-        for nombre, info in puntos.items():
-            lat, lon = info["coords"]
-            color = info.get("color", PUNTO_FACE_DEFAULT)
-            px, py = m(lon, lat)
-            plt.plot(px, py, marker=PUNTO_MARKER, ms=PUNTO_MS,
-                     mfc=color, mec=PUNTO_EDGE, mew=1.4, zorder=13)
-            plt.text(px-6000, py, nombre, fontsize=14, color="#111", ha="right", va="center", zorder=13)
+            fname = csv_path.stem
+            fdate = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
+            fstr  = re.search(r"f=(\d{1,4}(?:[.,]\d+)?)\s*Hz", fname, re.IGNORECASE)
+            date_str = fdate.group(1) if fdate else ""
+            freq_str = (fstr.group(1).replace(",", ".")+" Hz") if fstr else "100 Hz"
+            estacion = obtener_estacion_por_fecha(csv_path.name)
+            plt.title(f"Pérdidas por transmisión — {VAL_COL}, f = {freq_str}, estación: {estacion}", pad=30)
+            if pcm is not None:
+                cbar = plt.colorbar(pcm, orientation="vertical", pad=0.02, shrink=0.85)
+                cbar.mappable.set_clim(CMAP_MIN, CMAP_MAX)
+                cbar.update_normal(cbar.mappable)
+                cbar.ax.set_xlabel("TL(dB)", labelpad=8, loc="right")
+                label = cbar.ax.xaxis.get_label()
+                label.set_x(4.0)
+            ax = plt.gca()
+            ax.tick_params(axis='both', which='major', labelsize=22)
+            plt.subplots_adjust(left=0.12, right=0.95, top=0.92, bottom=0.10)
+            out_path = out_dir / (csv_path.stem + f"_{VAL_COL}_map.png")
+            plt.tight_layout()
+            plt.savefig(out_path, dpi=DPI)
+            plt.close()
+            print(f"✔ Figura guardada en {out_path}")
 
-        # Puntos medidos (apagados por defecto)
-        sc = None
+        # --- Si DIBUJAR_PUNTOS_TL, generar mapa de puntos en mapas_rayos/VAL_COL/ ---
         if DIBUJAR_PUNTOS_TL:
+            out_dir_rayos = MAPAS_RAYOS_DIR_BASE / VAL_COL
+            out_dir_rayos.mkdir(parents=True, exist_ok=True)
+            plt.figure(figsize=(10, 9))
+            m = build_basemap(lat_min, lat_max, lon_min, lon_max)
+            draw_base(m)
             x, y = m(lons, lats)
             sc = plt.scatter(x, y, c=vals,
                              s=DATA_SCATTER_S, cmap=CMAP_NAME,
                              vmin=CMAP_MIN, vmax=CMAP_MAX,
                              marker=DATA_MARKER, edgecolors="none", zorder=11)
-
-        # Grilla arriba de todo
-        draw_grid_top(m)
-
-        # Colorbar vertical con título horizontal
-        mappable = pcm if (pcm is not None) else sc
-        if mappable is not None:
-            cbar = plt.colorbar(mappable, orientation="vertical", pad=0.02, shrink=0.85)
-            cbar.mappable.set_clim(CMAP_MIN, CMAP_MAX)
-            cbar.update_normal(cbar.mappable)
-            cbar.ax.set_xlabel("TL(dB)", labelpad=8, loc="right")
-            label = cbar.ax.xaxis.get_label()
-            label.set_x(4.0)  # Ajusta el valor para mover el texto más a la derecha
-
-        # Título
-        fname = csv_path.stem  # Usar el nombre real, sin invertir
-        fdate = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
-        fstr  = re.search(r"f=(\d{1,4}(?:[.,]\d+)?)\s*Hz", fname, re.IGNORECASE)
-        date_str = fdate.group(1) if fdate else ""
-        freq_str = (fstr.group(1).replace(",", ".")+" Hz") if fstr else "100 Hz"
-        estacion = obtener_estacion_por_fecha(csv_path.name)
-        plt.title(f"Pérdidas por transmisión — {VAL_COL}, f = {freq_str}, estación: {estacion}", pad=30)
-
-        # Etiquetas de coordenadas lat/lon más grandes
-        ax = plt.gca()
-        ax.tick_params(axis='both', which='major', labelsize=22)
-        plt.subplots_adjust(left=0.12, right=0.95, top=0.92, bottom=0.10)
-
-        # Guardar
-        out_path = MAPAS_DIR / (csv_path.stem + f"_{VAL_COL}_map.png")
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=DPI)
-        plt.close()
-        print(f"✔ Figura guardada en {out_path}")
-
+            # Grilla de coordenadas (lat/lon)
+            draw_grid_top(m)
+            # Capas NE adicionales (líneas) con pyshp y filtro por bbox
+            bbox_ll = (lat_min, lat_max, lon_min, lon_max)
+            CAPAS_DIR.mkdir(parents=True, exist_ok=True)
+            if DIBUJAR_LIMITES_PROVINCIALES:
+                shp_admin = ensure_layer(CAPAS_DIR, "admin_1_lines")
+                if shp_admin:
+                    draw_shp_lines_pyshp(m, shp_admin, bbox_ll, linewidth=0.7, color="#555555", zorder=8)
+            if DIBUJAR_RUTAS:
+                shp_roads = ensure_layer(CAPAS_DIR, "roads")
+                if shp_roads:
+                    draw_shp_lines_pyshp(m, shp_roads, bbox_ll, linewidth=0.6, color="#8B4513", zorder=9)
+            if DIBUJAR_RIOS:
+                shp_riv = ensure_layer(CAPAS_DIR, "rivers")
+                if shp_riv:
+                    draw_shp_lines_pyshp(m, shp_riv, bbox_ll, linewidth=0.6, color="#1f77b4", zorder=9)
+            # Ciudades (encima)
+            if DIBUJAR_CIUDADES:
+                for name, lat, lon in CUSTOM_PLACES:
+                    xci, yci = m(lon, lat)
+                    if isinstance(xci, (np.ndarray, list)):
+                        xci = float(np.atleast_1d(xci)[0])
+                    if isinstance(yci, (np.ndarray, list)):
+                        yci = float(np.atleast_1d(yci)[0])
+                    plt.plot([xci],[yci], marker="o", ms=10, mfc="#222222", mec="#FFFFFF", mew=0.6, zorder=12)
+                    if name in ["Bahía Creek", "La Ensenada"]:
+                        plt.text(xci-6000, yci+14000, name, fontsize=14, color="#111",
+                                 ha="left", va="top", zorder=12)
+                    else:
+                        plt.text(xci-6000, yci+6000, name, fontsize=14, color="#111",
+                                 ha="right", va="top", zorder=12)
+            # Punto especial (encima)
+            if DIBUJAR_PUNTO_ESPECIAL:
+                pe = elegir_punto_especial(csv_path.name)
+                if pe is not None:
+                    pe_lon, pe_lat, pe_label = pe
+                    color = PUNTO_FACE_DEFAULT
+                    if pe_label == "Planta":
+                        color = puntos["p2_planta"].get("color", color)
+                    elif pe_label == "Tránsito":
+                        color = puntos["p1_transito"].get("color", color)
+                    px, py = m(pe_lon, pe_lat)
+                    if isinstance(px, (np.ndarray, list)):
+                        px = float(np.atleast_1d(px)[0])
+                    if isinstance(py, (np.ndarray, list)):
+                        py = float(np.atleast_1d(py)[0])
+                    plt.plot(px, py, marker=PUNTO_MARKER, ms=PUNTO_MS,
+                             mfc=color, mec=PUNTO_EDGE, mew=1.4, zorder=12)
+                    plt.text(px-6000, py, pe_label, fontsize=9, color="#111", ha="right", va="center", zorder=12)
+            # Puntos de análisis
+            for nombre, info in puntos.items():
+                coords = info.get("coords", (None, None))
+                if not (isinstance(coords, (tuple, list)) and len(coords) == 2):
+                    print(f"Advertencia: coords inválido para '{nombre}': {coords}")
+                    continue
+                lat, lon = coords
+                color = info.get("color", PUNTO_FACE_DEFAULT)
+                px, py = m(lon, lat)
+                if isinstance(px, (np.ndarray, list)):
+                    px = float(np.atleast_1d(px)[0])
+                if isinstance(py, (np.ndarray, list)):
+                    py = float(np.atleast_1d(py)[0])
+                plt.plot(px, py, marker=PUNTO_MARKER, ms=PUNTO_MS,
+                         mfc=color, mec=PUNTO_EDGE, mew=1.4, zorder=13)
+                plt.text(px-6000, py, nombre, fontsize=14, color="#111", ha="right", va="center", zorder=13)
+            mappable = sc
+            if mappable is not None:
+                cbar = plt.colorbar(mappable, orientation="vertical", pad=0.04, shrink=0.85)
+                cbar.mappable.set_clim(CMAP_MIN, CMAP_MAX)
+                cbar.update_normal(cbar.mappable)
+                cbar.ax.set_xlabel("TL(dB)", labelpad=8, loc="right")
+                label = cbar.ax.xaxis.get_label()
+                label.set_x(4.0)
+            fname = csv_path.stem
+            fdate = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
+            fstr  = re.search(r"f=(\d{1,4}(?:[.,]\d+)?)\s*Hz", fname, re.IGNORECASE)
+            date_str = fdate.group(1) if fdate else ""
+            freq_str = (fstr.group(1).replace(",", ".")+" Hz") if fstr else "100 Hz"
+            estacion = obtener_estacion_por_fecha(csv_path.name)
+            plt.title(f"Puntos medidos — {VAL_COL}, f = {freq_str}, estación: {estacion}", pad=30)
+            ax = plt.gca()
+            ax.tick_params(axis='both', which='major', labelsize=22)
+            plt.subplots_adjust(left=0.12, right=0.97, top=0.92, bottom=0.10)
+            out_path_rayos = out_dir_rayos / (csv_path.stem + f"_{VAL_COL}_rayos.png")
+            plt.tight_layout()
+            plt.savefig(out_path_rayos, dpi=DPI)
+            plt.close()
+            print(f"✔ Figura de puntos guardada en {out_path_rayos}")
 # =========================
 # MAIN
 # =========================
